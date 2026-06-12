@@ -1,0 +1,31 @@
+# Environment — never commit secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# Project data (SQLite DBs, OAuth tokens, traces)
+data/
+*.db
+*.sqlite3
+
+# Playwright (project-local browsers + artifacts)
+.playwright-browsers/
+demo/recordings/
+
+# Claude local files
+.claude/settings.local.json
+CLAUDE.local.md
+
+# OS
+Thumbs.db
+.DS_Store
