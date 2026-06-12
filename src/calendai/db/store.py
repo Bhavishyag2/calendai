@@ -1,7 +1,7 @@
 """SQLite persistence layer.
 
 One Store per process (or per eval scenario). Connections are opened eagerly
-and must be closed explicitly — the eval runner relies on close() so temp DB
+and must be closed explicitly - the eval runner relies on close() so temp DB
 files can be deleted on Windows.
 """
 
@@ -12,7 +12,9 @@ import sqlite3
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
+from typing import Any
 
+from calendai.auth.tokens import TokenCipher
 from calendai.core.clock import Clock, SystemClock
 from calendai.core.models import FactType, MemoryFact, User
 
@@ -44,11 +46,17 @@ class Store:
     def close(self) -> None:
         self._conn.close()
 
+    def __enter__(self) -> Store:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
     @property
     def conn(self) -> sqlite3.Connection:
         return self._conn
 
-    # ── users ──────────────────────────────────────────────────────────
+    # -- users ----------------------------------------------------------
 
     def upsert_user(self, user: User) -> User:
         now = _iso(self._clock.now())
@@ -86,44 +94,49 @@ class Store:
             created_at=_parse_dt(row["created_at"]),
         )
 
-    # ── memory facts ───────────────────────────────────────────────────
+    # -- memory facts ---------------------------------------------------
 
     def upsert_fact(self, fact: MemoryFact) -> MemoryFact:
         """Insert a fact; if an active fact with the same (user, key) exists,
-        the old one is deactivated and linked via superseded_by."""
+        the old one is deactivated and linked via superseded_by.
+
+        Atomic: serialization happens before any mutation, and the
+        deactivate -> insert -> link sequence runs in one transaction, so a
+        failure can never leave the user without an active fact.
+        """
+        value_json = json.dumps(fact.value, sort_keys=True)  # fail BEFORE mutating
         now = _iso(self._clock.now())
-        cur = self._conn.cursor()
-        old = cur.execute(
-            "SELECT id FROM memory_facts WHERE user_id = ? AND key = ? AND active = 1",
-            (fact.user_id, fact.key),
-        ).fetchone()
-        if old:
-            cur.execute(
-                "UPDATE memory_facts SET active = 0, updated_at = ? WHERE id = ?",
-                (now, old["id"]),
+        with self._conn:  # transaction: commits on success, rolls back on error
+            old = self._conn.execute(
+                "SELECT id FROM memory_facts WHERE user_id = ? AND key = ? AND active = 1",
+                (fact.user_id, fact.key),
+            ).fetchone()
+            if old:
+                self._conn.execute(
+                    "UPDATE memory_facts SET active = 0, updated_at = ? WHERE id = ?",
+                    (now, old["id"]),
+                )
+            cur = self._conn.execute(
+                """INSERT INTO memory_facts
+                   (user_id, fact_type, key, value, statement, provenance, active,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+                (
+                    fact.user_id,
+                    fact.fact_type.value,
+                    fact.key,
+                    value_json,
+                    fact.statement,
+                    fact.provenance,
+                    now,
+                    now,
+                ),
             )
-        cur.execute(
-            """INSERT INTO memory_facts
-               (user_id, fact_type, key, value, statement, provenance, active,
-                created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)""",
-            (
-                fact.user_id,
-                fact.fact_type.value,
-                fact.key,
-                json.dumps(fact.value, sort_keys=True),
-                fact.statement,
-                fact.provenance,
-                now,
-                now,
-            ),
-        )
-        new_id = cur.lastrowid
-        if old:
-            cur.execute(
-                "UPDATE memory_facts SET superseded_by = ? WHERE id = ?", (new_id, old["id"])
-            )
-        self._conn.commit()
+            new_id = cur.lastrowid
+            if old:
+                self._conn.execute(
+                    "UPDATE memory_facts SET superseded_by = ? WHERE id = ?", (new_id, old["id"])
+                )
         return self.get_fact(new_id)  # type: ignore[arg-type,return-value]
 
     def get_fact(self, fact_id: int) -> MemoryFact | None:
@@ -140,7 +153,7 @@ class Store:
             params.append(fact_type.value)
         if active_only:
             query += " AND active = 1"
-        query += " ORDER BY created_at"
+        query += " ORDER BY created_at, id"  # id tie-breaker: deterministic under FrozenClock
         rows = self._conn.execute(query, params).fetchall()
         return [self._row_to_fact(r) for r in rows]
 
@@ -166,7 +179,7 @@ class Store:
             updated_at=_parse_dt(row["updated_at"]),
         )
 
-    # ── sessions ───────────────────────────────────────────────────────
+    # -- sessions -------------------------------------------------------
 
     def create_session(self, token: str, user_id: str, expires_at: datetime | None = None) -> None:
         self._conn.execute(
@@ -186,7 +199,7 @@ class Store:
             return None
         return self.get_user(row["user_id"])
 
-    # ── messages ───────────────────────────────────────────────────────
+    # -- messages -------------------------------------------------------
 
     def add_message(
         self, user_id: str, role: str, content: str, session_token: str | None = None
@@ -206,9 +219,14 @@ class Store:
         ).fetchall()
         return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
-    # ── oauth tokens ───────────────────────────────────────────────────
+    # -- oauth tokens (encryption enforced by API shape) ----------------
 
-    def save_token_blob(self, user_id: str, blob: bytes, provider: str = "google") -> None:
+    def save_oauth_token(
+        self, user_id: str, payload: dict[str, Any], cipher: TokenCipher, provider: str = "google"
+    ) -> None:
+        """Persist an OAuth token payload, Fernet-encrypted. There is no
+        public path that stores a plaintext token."""
+        blob = cipher.encrypt(payload)
         self._conn.execute(
             """INSERT INTO oauth_tokens (user_id, provider, token_blob, updated_at)
                VALUES (?, ?, ?, ?)
@@ -220,8 +238,8 @@ class Store:
         )
         self._conn.commit()
 
-    def get_token_blob(self, user_id: str) -> bytes | None:
+    def load_oauth_token(self, user_id: str, cipher: TokenCipher) -> dict[str, Any] | None:
         row = self._conn.execute(
             "SELECT token_blob FROM oauth_tokens WHERE user_id = ?", (user_id,)
         ).fetchone()
-        return row["token_blob"] if row else None
+        return cipher.decrypt(row["token_blob"]) if row else None

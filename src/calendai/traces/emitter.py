@@ -1,6 +1,6 @@
 """Request tracing: what the agent did and why.
 
-Every user request produces one trace_request row and a series of spans —
+Every user request produces one trace_request row and a series of spans -
 LLM calls (with token usage and latency), tool calls (with args, result, and
 retry count), memory operations, and explicit decision rationales. The
 /traces endpoint renders these; the eval suite asserts on them.
@@ -12,11 +12,32 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC
+from datetime import datetime as _datetime
 from typing import Any, Protocol
+
+from pydantic import BaseModel
 
 from calendai.core.clock import Clock, SystemClock
 from calendai.core.models import SpanKind
 from calendai.db.store import Store
+
+
+def _json_default(value: Any) -> Any:
+    """Normalize known types into machine-readable JSON; reject the rest.
+
+    Evals parse trace payloads programmatically, so accidental str()
+    coercion of arbitrary objects would silently corrupt them.
+    """
+    if isinstance(value, _datetime):
+        return value.isoformat()
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, Exception):
+        return f"{type(value).__name__}: {value}"
+    raise TypeError(
+        f"trace payload contains non-JSON-safe value of type {type(value).__name__}; "
+        "convert it before recording"
+    )
 
 
 class LiveSpan:
@@ -51,8 +72,10 @@ class SQLiteTraceEmitter:
         return self._clock.now().astimezone(UTC).isoformat()
 
     def begin_request(self, request_id: str, user_id: str | None, user_message: str) -> None:
+        # Plain INSERT: a duplicate request_id is a bug and must fail loudly
+        # rather than silently merging spans into an older trace.
         self._store.conn.execute(
-            """INSERT OR IGNORE INTO trace_requests
+            """INSERT INTO trace_requests
                (request_id, user_id, user_message, started_at) VALUES (?, ?, ?, ?)""",
             (request_id, user_id, user_message, self._now()),
         )
@@ -82,7 +105,7 @@ class SQLiteTraceEmitter:
                     live.name,
                     started,
                     self._now(),
-                    json.dumps(live.payload, sort_keys=True, default=str),
+                    json.dumps(live.payload, sort_keys=True, default=_json_default),
                     live.rationale,
                 ),
             )
@@ -109,7 +132,9 @@ class SQLiteTraceEmitter:
 
     def recent_requests(self, limit: int = 50) -> list[dict[str, Any]]:
         rows = self._store.conn.execute(
-            "SELECT * FROM trace_requests ORDER BY started_at DESC LIMIT ?", (limit,)
+            # rowid tie-breaker keeps ordering deterministic under FrozenClock
+            "SELECT * FROM trace_requests ORDER BY started_at DESC, rowid DESC LIMIT ?",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
 

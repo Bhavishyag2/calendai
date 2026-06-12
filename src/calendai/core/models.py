@@ -1,61 +1,112 @@
 """Shared data contracts.
 
-These models are frozen after the Batch 1 review gate — the Google provider
+These models are frozen after the Batch 1 review gate - the Google provider
 track and the eval-harness track both fork from the shapes defined here.
+
+Datetime discipline: every datetime in these models must be timezone-aware;
+values are normalized to UTC at validation time. Naive datetimes are rejected
+outright so behavior can never depend on the host machine's timezone.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field, model_validator
+
+
+def _require_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        raise ValueError("datetime must be timezone-aware (naive datetimes are rejected)")
+    return dt.astimezone(UTC)
+
+
+UtcDatetime = Annotated[datetime, AfterValidator(_require_utc)]
 
 
 class EventStatus(StrEnum):
     CONFIRMED = "confirmed"
+    TENTATIVE = "tentative"
     CANCELLED = "cancelled"
+
+
+class AttendeeResponseStatus(StrEnum):
+    NEEDS_ACTION = "needsAction"
+    ACCEPTED = "accepted"
+    DECLINED = "declined"
+    TENTATIVE = "tentative"
 
 
 class Attendee(BaseModel):
     email: str
-    response_status: str = "needsAction"
+    response_status: AttendeeResponseStatus = AttendeeResponseStatus.NEEDS_ACTION
 
 
 class EventDraft(BaseModel):
-    """What callers provide to create an event. Times are aware datetimes (stored UTC)."""
+    """What callers provide to create an event."""
 
     title: str
-    start: datetime
-    end: datetime
+    start: UtcDatetime
+    end: UtcDatetime
     description: str = ""
     attendees: list[Attendee] = Field(default_factory=list)
 
+    @model_validator(mode="after")
+    def _start_before_end(self) -> EventDraft:
+        if self.start >= self.end:
+            raise ValueError("event start must be strictly before end")
+        return self
+
 
 class Event(EventDraft):
-    """A stored calendar event."""
+    """A stored calendar event.
+
+    `organizer` is the calendar that owns the event; invite copies on attendee
+    calendars share the same `id` but carry their own `calendar_id` (mirroring
+    Google semantics). The agent uses organizer to distinguish "my event" from
+    "an event I was invited to".
+    """
 
     id: str
     calendar_id: str
+    organizer: str
     status: EventStatus = EventStatus.CONFIRMED
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    created_at: UtcDatetime | None = None
+    updated_at: UtcDatetime | None = None
 
 
 class EventPatch(BaseModel):
-    """Partial update; None means leave the field unchanged."""
+    """Partial update; None means leave the field unchanged.
+
+    When only one of start/end is given, the merged interval is validated by
+    the provider against the stored event (model validation alone cannot see
+    the other endpoint).
+    """
 
     title: str | None = None
-    start: datetime | None = None
-    end: datetime | None = None
+    start: UtcDatetime | None = None
+    end: UtcDatetime | None = None
     description: str | None = None
     attendees: list[Attendee] | None = None
 
+    @model_validator(mode="after")
+    def _start_before_end_if_both(self) -> EventPatch:
+        if self.start is not None and self.end is not None and self.start >= self.end:
+            raise ValueError("event start must be strictly before end")
+        return self
+
 
 class TimeSlot(BaseModel):
-    start: datetime
-    end: datetime
+    start: UtcDatetime
+    end: UtcDatetime
+
+    @model_validator(mode="after")
+    def _start_before_end(self) -> TimeSlot:
+        if self.start >= self.end:
+            raise ValueError("slot start must be strictly before end")
+        return self
 
 
 class FactType(StrEnum):
@@ -82,8 +133,8 @@ class MemoryFact(BaseModel):
     statement: str
     provenance: str
     active: bool = True
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    created_at: UtcDatetime | None = None
+    updated_at: UtcDatetime | None = None
 
 
 class User(BaseModel):
@@ -91,7 +142,7 @@ class User(BaseModel):
     email: str
     display_name: str = ""
     timezone: str = "Asia/Kolkata"  # IANA name; all storage is UTC, this is for rendering
-    created_at: datetime | None = None
+    created_at: UtcDatetime | None = None
 
 
 class ToolOutcome(BaseModel):
@@ -115,7 +166,7 @@ class TraceSpan(BaseModel):
     request_id: str
     kind: SpanKind
     name: str
-    started_at: datetime
-    ended_at: datetime | None = None
+    started_at: UtcDatetime
+    ended_at: UtcDatetime | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     rationale: str | None = None

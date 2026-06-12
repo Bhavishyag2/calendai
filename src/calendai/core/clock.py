@@ -1,7 +1,7 @@
 """Time source abstraction so the eval suite can freeze "now".
 
 Everything that needs the current time takes a Clock, never calls
-datetime.now() directly — that single rule is what makes the evaluation
+datetime.now() directly - that single rule is what makes the evaluation
 pipeline deterministic.
 """
 

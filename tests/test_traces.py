@@ -44,3 +44,35 @@ def test_null_emitter_is_silent(clock):
     with emitter.span("r", SpanKind.DECISION, "noop") as span:
         span.rationale = "discarded"
     emitter.end_request("r")
+
+
+def test_duplicate_request_id_fails_loudly(store, clock):
+    import sqlite3
+
+    emitter = SQLiteTraceEmitter(store, clock=clock)
+    emitter.begin_request("req_dup", "u", "first")
+    with pytest.raises(sqlite3.IntegrityError):
+        emitter.begin_request("req_dup", "u", "second")
+
+
+def test_payload_normalizes_known_types_and_rejects_garbage(store, clock):
+    from calendai.core.models import TimeSlot
+    from tests.conftest import at
+
+    emitter = SQLiteTraceEmitter(store, clock=clock)
+    emitter.begin_request("req_json", "u", "x")
+
+    # datetimes and Pydantic models serialize machine-readably
+    with emitter.span("req_json", SpanKind.TOOL_CALL, "ok") as span:
+        span.payload = {"when": at(5), "slot": TimeSlot(start=at(5), end=at(6))}
+    payload = emitter.spans_for("req_json")[0]["payload"]
+    from datetime import datetime
+
+    # Compare parsed datetimes: stdlib isoformat uses +00:00, Pydantic uses Z
+    assert datetime.fromisoformat(payload["when"]) == at(5)
+    assert datetime.fromisoformat(payload["slot"]["start"]) == at(5)
+
+    # arbitrary objects are rejected, not silently stringified
+    with pytest.raises(TypeError, match="non-JSON-safe"):  # noqa: SIM117
+        with emitter.span("req_json", SpanKind.TOOL_CALL, "bad") as span:
+            span.payload = {"oops": object()}

@@ -97,9 +97,49 @@ def test_sessions(store: Store):
     assert store.get_session_user("nope") is None
 
 
-def test_token_blob_roundtrip(store: Store):
+def test_oauth_token_encrypted_at_rest(store: Store):
+    """The security contract: plaintext tokens must never reach disk."""
+    from cryptography.fernet import Fernet
+
+    from calendai.auth.tokens import TokenCipher
+
+    cipher = TokenCipher(Fernet.generate_key().decode())
+    secret = {"access_token": "ya29.SUPER_SECRET_VALUE", "refresh_token": "1//refresh_me"}
+
     store.upsert_user(ALICE)
-    store.save_token_blob(ALICE.id, b"encrypted-bytes")
-    assert store.get_token_blob(ALICE.id) == b"encrypted-bytes"
-    store.save_token_blob(ALICE.id, b"rotated")
-    assert store.get_token_blob(ALICE.id) == b"rotated"
+    store.save_oauth_token(ALICE.id, secret, cipher)
+
+    # Roundtrip works...
+    assert store.load_oauth_token(ALICE.id, cipher) == secret
+    # ...and the raw bytes in the DB contain no plaintext token material.
+    raw = store.conn.execute("SELECT token_blob FROM oauth_tokens").fetchone()["token_blob"]
+    assert b"SUPER_SECRET_VALUE" not in raw
+    assert b"refresh_me" not in raw
+
+    # Rotation overwrites in place.
+    store.save_oauth_token(ALICE.id, {"access_token": "rotated"}, cipher)
+    assert store.load_oauth_token(ALICE.id, cipher) == {"access_token": "rotated"}
+
+
+def test_fact_upsert_failure_leaves_old_fact_active(store: Store):
+    """Atomicity: a failed supersession must not deactivate the old rule."""
+    store.upsert_user(ALICE)
+    store.upsert_fact(rule_fact("Never before 10:00"))
+
+    bad = rule_fact("Never before 09:00")
+    bad.value = {"unserializable": object()}  # JSON serialization will fail
+    import pytest
+
+    with pytest.raises(TypeError):
+        store.upsert_fact(bad)
+
+    active = store.list_facts(ALICE.id)
+    assert len(active) == 1
+    assert active[0].statement == "Never before 10:00"  # old rule survived
+
+
+def test_store_context_manager(tmp_path, clock):
+    with Store(tmp_path / "ctx.db", clock=clock) as s:
+        s.upsert_user(ALICE)
+    # connection closed: the temp file is deletable on Windows
+    (tmp_path / "ctx.db").unlink()

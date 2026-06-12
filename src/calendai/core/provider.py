@@ -23,7 +23,7 @@ class ProviderError(Exception):
 
 
 class RateLimitError(ProviderError):
-    """HTTP 429 — caller should back off and retry."""
+    """HTTP 429 - caller should back off and retry."""
 
     def __init__(self, message: str = "rate limited", *, retry_after: float = 1.0) -> None:
         super().__init__(message, retryable=True)
@@ -31,14 +31,14 @@ class RateLimitError(ProviderError):
 
 
 class ServerError(ProviderError):
-    """HTTP 5xx — transient upstream failure, retryable."""
+    """HTTP 5xx - transient upstream failure, retryable."""
 
     def __init__(self, message: str = "server error") -> None:
         super().__init__(message, retryable=True)
 
 
 class AuthError(ProviderError):
-    """Token invalid/expired beyond refresh — needs re-authentication."""
+    """Token invalid/expired beyond refresh - needs re-authentication."""
 
 
 class NotFoundError(ProviderError):
@@ -74,4 +74,10 @@ class CalendarProvider(ABC):
     def freebusy(
         self, calendar_ids: list[str], start: datetime, end: datetime
     ) -> dict[str, list[TimeSlot]]:
-        """Busy periods per calendar within [start, end), merged and sorted."""
+        """Busy periods per calendar within [start, end), merged and sorted.
+
+        Contract: all-or-nothing. If any requested calendar cannot be queried
+        (permission denied, unknown calendar, upstream error), the call raises
+        a ProviderError rather than returning partial results - the agent must
+        never propose a slot based on incomplete availability data.
+        """

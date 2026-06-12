@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from calendai.core.models import Attendee, EventDraft, EventPatch
+from calendai.core.models import (
+    Attendee,
+    AttendeeResponseStatus,
+    EventDraft,
+    EventPatch,
+)
 from calendai.core.provider import (
     MalformedResponseError,
     NotFoundError,
@@ -79,6 +84,8 @@ def test_attendee_gets_mirrored_event(provider):
     bobs_copy = provider.get_event(BOB, event.id)
     assert bobs_copy.title == "Sync"
     assert bobs_copy.calendar_id == BOB
+    assert bobs_copy.organizer == ALICE  # invite copy keeps organizer identity
+    assert event.organizer == ALICE
 
 
 def test_update_propagates_to_attendee_calendars(provider):
@@ -92,6 +99,35 @@ def test_delete_propagates_to_attendee_calendars(provider):
     provider.delete_event(ALICE, event.id)
     with pytest.raises(NotFoundError):
         provider.get_event(BOB, event.id)
+
+
+def test_patch_adding_attendee_creates_mirror(provider):
+    event = provider.create_event(ALICE, draft("Sync", 5, 6))
+    provider.update_event(ALICE, event.id, EventPatch(attendees=[Attendee(email=BOB)]))
+    assert provider.get_event(BOB, event.id).organizer == ALICE
+
+
+def test_patch_removing_attendee_deletes_mirror(provider):
+    event = provider.create_event(ALICE, draft("Sync", 5, 6, attendees=[BOB]))
+    provider.update_event(ALICE, event.id, EventPatch(attendees=[]))
+    with pytest.raises(NotFoundError):
+        provider.get_event(BOB, event.id)
+    provider.get_event(ALICE, event.id)  # organizer copy untouched
+
+
+def test_patch_replacing_attendees_swaps_mirrors(provider):
+    carol = "carol@example.com"
+    event = provider.create_event(ALICE, draft("Sync", 5, 6, attendees=[BOB]))
+    provider.update_event(ALICE, event.id, EventPatch(attendees=[Attendee(email=carol)]))
+    with pytest.raises(NotFoundError):
+        provider.get_event(BOB, event.id)
+    assert provider.get_event(carol, event.id).title == "Sync"
+
+
+def test_update_rejects_inverted_merged_interval(provider):
+    event = provider.create_event(ALICE, draft("Sync", 5, 6))
+    with pytest.raises(ValueError, match="strictly before"):
+        provider.update_event(ALICE, event.id, EventPatch(start=at(7)))  # start after stored end
 
 
 # ── freebusy ──────────────────────────────────────────────────────────
@@ -123,6 +159,19 @@ def test_freebusy_reflects_invites(provider):
     provider.create_event(ALICE, draft("Sync", 5, 6, attendees=[BOB]))
     busy = provider.freebusy([BOB], at(0), at(23))[BOB]
     assert len(busy) == 1
+
+
+def test_declined_attendee_is_not_busy(provider):
+    """Google semantics: declining an invite frees that attendee's slot,
+    while the organizer remains busy."""
+    declined = Attendee(email=BOB, response_status=AttendeeResponseStatus.DECLINED)
+    provider.create_event(
+        ALICE,
+        EventDraft(title="Sync", start=at(5), end=at(6), attendees=[declined]),
+    )
+    busy = provider.freebusy([ALICE, BOB], at(0), at(23))
+    assert len(busy[ALICE]) == 1
+    assert busy[BOB] == []
 
 
 # ── failure injection ─────────────────────────────────────────────────
@@ -159,3 +208,18 @@ def test_deterministic_ids(provider):
     e1 = provider.create_event(ALICE, draft("First", 5, 6))
     e2 = provider.create_event(ALICE, draft("Second", 7, 8))
     assert (e1.id, e2.id) == ("evt_0001", "evt_0002")
+
+
+def test_inject_failure_rejects_unknown_action(provider):
+    with pytest.raises(ValueError, match="unknown provider action"):
+        provider.inject_failure("create_evnet", ServerError())  # typo fails loudly
+
+
+def test_inject_failure_factory_yields_fresh_instances(provider):
+    provider.inject_failure("list_events", lambda: ServerError("fresh"), times=2)
+    captured = []
+    for _ in range(2):
+        with pytest.raises(ServerError) as exc_info:
+            provider.list_events(ALICE, at(0), at(23))
+        captured.append(exc_info.value)
+    assert captured[0] is not captured[1]
