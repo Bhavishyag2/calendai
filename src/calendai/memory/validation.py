@@ -14,6 +14,7 @@ import json
 import re
 from datetime import time as dt_time
 from typing import Any
+from zoneinfo import ZoneInfo
 
 KEY_RE = re.compile(r"^(rule|contact|pref):[a-z0-9_]+$")
 PREFIX_TO_TYPE = {"rule": "rule", "contact": "contact", "pref": "preference"}
@@ -42,6 +43,16 @@ def _valid_time_rule(value: dict[str, Any]) -> str | None:
         parse_hhmm(value["time"])
     except (KeyError, ValueError, TypeError):
         return 'value must be {"time": "HH:MM", "timezone": "<IANA, optional>"}'
+    tz = value.get("timezone")
+    if tz is not None:
+        # a bad timezone stored now would silently disable the rule at
+        # enforcement time - reject it while the model can still self-correct
+        if not isinstance(tz, str):
+            return "timezone must be an IANA string like Asia/Kolkata, or omitted"
+        try:
+            ZoneInfo(tz)
+        except (KeyError, ValueError):
+            return f"unknown timezone {tz!r}; use IANA names like Asia/Kolkata"
     return None
 
 
@@ -56,12 +67,10 @@ def _valid_days_rule(value: dict[str, Any]) -> str | None:
 
 
 def _valid_minutes_rule(value: dict[str, Any]) -> str | None:
-    try:
-        minutes = int(value["minutes"])
-    except (KeyError, ValueError, TypeError):
+    minutes = value.get("minutes")
+    # bool is an int subclass; "true" must not become a 1-minute cap
+    if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0:
         return 'value must be {"minutes": <positive int>}'
-    if minutes <= 0:
-        return "minutes must be positive"
     return None
 
 

@@ -37,20 +37,35 @@ def _overlaps_daily_window(
 ) -> bool:
     """Does the half-open event [start, end) touch the daily window
     [win_start, win_end) on any day it spans? win_end=None means midnight
-    (end of day). Datetimes must already be in the rule's timezone."""
+    (end of day). Datetimes must already be in the rule's timezone.
+
+    DST: window boundaries are computed for BOTH folds of an ambiguous local
+    time, and an overlap with either counts. During a fall-back hour this is
+    deliberately conservative (an event in the repeated hour may be blocked
+    even if one wall-clock reading complies) - for hard constraints,
+    over-blocking one hour a year beats silently under-blocking.
+    """
+    if win_start == win_end:
+        return False  # empty window, e.g. "no meetings before 00:00"
     if (local_end - local_start).days > _MAX_WINDOW_DAYS:
         return True  # multi-year event: certainly overlaps; avoid silly loops
     tz = local_start.tzinfo
+    # Compare epoch INSTANTS, never datetimes: Python compares same-tzinfo
+    # aware datetimes by wall clock, ignoring fold - exactly what would hide
+    # a violation inside the repeated DST hour.
+    ev0, ev1 = local_start.timestamp(), local_end.timestamp()
     day = local_start.date()
     while day <= local_end.date():
-        w0 = datetime.combine(day, win_start, tzinfo=tz)
-        w1 = (
-            datetime.combine(day + timedelta(days=1), dt_time(0, 0), tzinfo=tz)
-            if win_end is None
-            else datetime.combine(day, win_end, tzinfo=tz)
-        )
-        if local_start < w1 and local_end > w0:
-            return True
+        for fold in (0, 1):
+            w0 = datetime.combine(day, win_start, tzinfo=tz).replace(fold=fold)
+            w1 = (
+                datetime.combine(day + timedelta(days=1), dt_time(0, 0), tzinfo=tz)
+                if win_end is None
+                else datetime.combine(day, win_end, tzinfo=tz)
+            ).replace(fold=fold)
+            t0, t1 = w0.timestamp(), w1.timestamp()
+            if t1 > t0 and ev0 < t1 and ev1 > t0:
+                return True
         day += timedelta(days=1)
     return False
 
@@ -85,12 +100,14 @@ class RuleEngine:
     # -- per-rule checkers ----------------------------------------------------
 
     def _tz(self, fact: MemoryFact) -> ZoneInfo:
-        # fallback order: rule's own timezone -> user's timezone -> UTC
+        # fallback order: rule's own timezone -> user's timezone -> UTC.
+        # TypeError: legacy/direct writes may hold non-string values; write
+        # validation rejects those now, but reads must stay robust.
         for name in (fact.value.get("timezone"), self.user.timezone):
             if name:
                 try:
                     return ZoneInfo(name)
-                except (KeyError, ValueError):
+                except (KeyError, ValueError, TypeError):
                     continue
         return ZoneInfo("UTC")
 

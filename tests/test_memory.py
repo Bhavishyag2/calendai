@@ -147,6 +147,45 @@ def test_invalid_value_timezone_falls_back_to_user_tz(engine, store):
     assert engine.check("create_event", at(5), at(6)) is None
 
 
+def test_dst_fallback_hour_cannot_hide_violation(engine, store):
+    from datetime import UTC, datetime
+
+    # America/New_York 2026-11-01: clocks fall back at 02:00 EDT (06:00Z).
+    # 05:45Z-06:15Z reads 01:45 EDT -> 01:15 EST: the event occupies the
+    # repeated before-01:30 wall-clock window and must be blocked.
+    store.upsert_fact(
+        rule(
+            "rule:no_meetings_before",
+            {"time": "01:30", "timezone": "America/New_York"},
+            "Never before 01:30 ET",
+        )
+    )
+    start = datetime(2026, 11, 1, 5, 45, tzinfo=UTC)
+    end = datetime(2026, 11, 1, 6, 15, tzinfo=UTC)
+    assert engine.check("create_event", start, end) is not None
+
+
+def test_before_midnight_rule_blocks_nothing(engine, store):
+    store.upsert_fact(
+        rule("rule:no_meetings_before", {"time": "00:00"}, "Nothing before midnight (no-op)")
+    )
+    # even an overnight event crossing midnight is fine: the window is empty
+    assert engine.check("create_event", at(17, 30, day_offset=-1), at(3, 30)) is None
+
+
+def test_non_string_timezone_never_disables_rule(engine, store):
+    # legacy/direct write with a junk timezone: enforcement falls back to the
+    # user's tz instead of silently skipping the rule
+    store.upsert_fact(
+        rule(
+            "rule:no_meetings_before",
+            {"time": "10:00", "timezone": 5},
+            "Never before 10:00",
+        )
+    )
+    assert engine.check("create_event", at(3), at(4)) is not None  # 08:30 IST blocked
+
+
 def test_update_event_rule_enforced_after_confirmation(engine, store, provider, clock):
     from calendai.agent.tools import UpdateEventArgs
     from calendai.core.models import EventDraft
@@ -202,6 +241,27 @@ def test_save_tool_rejects_mistyped_key(store, provider, clock):
         )
     )
     assert not oversized.ok and oversized.error_type == "invalid_arguments"
+
+    bad_tz = toolbox.save_profile_fact(
+        SaveProfileFactArgs(
+            fact_type="rule",
+            key="rule:no_meetings_before",
+            value={"time": "10:00", "timezone": "IST"},  # not an IANA name
+            statement="Never before 10:00",
+        )
+    )
+    assert not bad_tz.ok and "timezone" in bad_tz.error
+
+    bool_minutes = toolbox.save_profile_fact(
+        SaveProfileFactArgs(
+            fact_type="rule",
+            key="rule:max_meeting_minutes",
+            value={"minutes": True},  # bool is not a positive int
+            statement="Cap meetings",
+        )
+    )
+    assert not bool_minutes.ok and bool_minutes.error_type == "invalid_arguments"
+    assert store.list_facts(ALICE.id) == []
 
 
 # -- profile ordering -------------------------------------------------------------
