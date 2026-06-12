@@ -165,6 +165,34 @@ def test_dst_fallback_hour_cannot_hide_violation(engine, store):
     assert engine.check("create_event", start, end) is not None
 
 
+def test_spring_forward_gap_cutoff_is_conservative(engine, store):
+    from datetime import UTC, datetime
+
+    # America/New_York 2026-03-08: 02:00 EST jumps to 03:00 EDT - a 02:30
+    # cutoff does not exist that day. The two fold mappings straddle the gap
+    # (06:30Z and 07:30Z); the rule conservatively blocks up to the LATER one
+    # (03:30 EDT). Documented widening: never under-blocks.
+    store.upsert_fact(
+        rule(
+            "rule:no_meetings_before",
+            {"time": "02:30", "timezone": "America/New_York"},
+            "Never before 02:30 ET",
+        )
+    )
+    inside_widened = engine.check(
+        "create_event",
+        datetime(2026, 3, 8, 7, 15, tzinfo=UTC),  # 03:15 EDT
+        datetime(2026, 3, 8, 7, 45, tzinfo=UTC),
+    )
+    assert inside_widened is not None  # conservative over-block, pinned
+    clearly_after = engine.check(
+        "create_event",
+        datetime(2026, 3, 8, 8, 0, tzinfo=UTC),  # 04:00 EDT
+        datetime(2026, 3, 8, 9, 0, tzinfo=UTC),
+    )
+    assert clearly_after is None
+
+
 def test_before_midnight_rule_blocks_nothing(engine, store):
     store.upsert_fact(
         rule("rule:no_meetings_before", {"time": "00:00"}, "Nothing before midnight (no-op)")

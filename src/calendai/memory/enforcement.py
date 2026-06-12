@@ -43,7 +43,10 @@ def _overlaps_daily_window(
     time, and an overlap with either counts. During a fall-back hour this is
     deliberately conservative (an event in the repeated hour may be blocked
     even if one wall-clock reading complies) - for hard constraints,
-    over-blocking one hour a year beats silently under-blocking.
+    over-blocking one hour a year beats silently under-blocking. Likewise at
+    spring-forward: a cutoff inside the NONEXISTENT local hour maps (per
+    fold) to instants on either side of the gap, which widens the blocked
+    interval up to the later mapping. Never under-blocks; pinned by tests.
     """
     if win_start == win_end:
         return False  # empty window, e.g. "no meetings before 00:00"
