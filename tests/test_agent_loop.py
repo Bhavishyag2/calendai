@@ -1,0 +1,216 @@
+from __future__ import annotations
+
+import pytest
+
+from calendai.agent.loop import BAIL_MESSAGE, MAX_ITERATIONS, AgentLoop
+from calendai.agent.tools import Toolbox
+from calendai.core.models import EventDraft, User
+from calendai.core.provider import RateLimitError, ServerError
+from calendai.traces.emitter import SQLiteTraceEmitter
+from tests.conftest import at
+from tests.scripted_client import ScriptedClient, text_response, tool_call
+
+ALICE = User(id="u_alice", email="alice@example.com", display_name="Alice")
+
+
+@pytest.fixture
+def harness(provider, store, clock):
+    """Builds an AgentLoop wired to the fake provider and a scripted LLM."""
+
+    def make(responses):
+        store.upsert_user(ALICE)
+        client = ScriptedClient(responses)
+        toolbox = Toolbox(
+            provider=provider, store=store, user=ALICE, clock=clock, sleep_fn=lambda _s: None
+        )
+        tracer = SQLiteTraceEmitter(store, clock=clock)
+        loop = AgentLoop(
+            client=client,
+            model="scripted-model",
+            toolbox=toolbox,
+            store=store,
+            tracer=tracer,
+            clock=clock,
+            user=ALICE,
+        )
+        return loop, client
+
+    return make
+
+
+def iso(hour: int) -> str:
+    return at(hour).isoformat()
+
+
+def spans(loop: AgentLoop):
+    return loop.tracer.spans_for(loop.last_request_id)
+
+
+# -- basics ---------------------------------------------------------------
+
+
+def test_plain_text_turn(harness):
+    loop, client = harness([text_response("Hello Alice!")])
+    assert loop.run_turn("hi") == "Hello Alice!"
+    kinds = [s["kind"] for s in spans(loop)]
+    assert kinds == ["llm_call"]
+    assert spans(loop)[0]["payload"]["stop_reason"] == "end_turn"
+
+
+def test_create_event_via_tool(harness, provider):
+    loop, client = harness(
+        [
+            tool_call(
+                "create_event",
+                {
+                    "title": "Standup",
+                    "start": iso(5),
+                    "end": iso(6),
+                    "rationale": "User asked for a standup.",
+                },
+            ),
+            text_response("Booked your standup."),
+        ]
+    )
+    reply = loop.run_turn("book a standup 10:30-11:30")
+    assert reply == "Booked your standup."
+    events = provider.list_events(ALICE.email, at(0), at(23))
+    assert [e.title for e in events] == ["Standup"]
+    tool_span = next(s for s in spans(loop) if s["kind"] == "tool_call")
+    assert tool_span["payload"]["ok"] is True
+    assert tool_span["rationale"] == "User asked for a standup."
+    assert "rationale" not in tool_span["payload"]["args"]
+
+
+def test_history_persists_across_turns(harness):
+    loop, client = harness([text_response("first"), text_response("second")])
+    loop.run_turn("message one")
+    loop.run_turn("message two")
+    sent = client.calls[1]["messages"]
+    contents = [m["content"] for m in sent if isinstance(m["content"], str)]
+    assert "message one" in contents and "first" in contents
+
+
+# -- self-correction --------------------------------------------------------
+
+
+def test_invalid_args_fed_back_for_self_correction(harness, provider):
+    loop, client = harness(
+        [
+            tool_call(
+                "create_event",
+                {
+                    "title": "Bad",
+                    "start": "2026-06-15T05:00:00",  # naive!
+                    "end": iso(6),
+                },
+            ),
+            tool_call("create_event", {"title": "Fixed", "start": iso(5), "end": iso(6)}),
+            text_response("Done after fixing my arguments."),
+        ]
+    )
+    reply = loop.run_turn("schedule something")
+    assert "Done" in reply
+    # first tool_result was an error and said why
+    first_result = client.calls[1]["messages"][-1]["content"][0]
+    assert first_result["is_error"] is True
+    assert "timezone-aware" in first_result["content"]
+    # event was created on the second attempt only
+    assert len(provider.list_events(ALICE.email, at(0), at(23))) == 1
+
+
+def test_unknown_tool_is_survivable(harness):
+    loop, client = harness(
+        [
+            tool_call("teleport_user", {"to": "goa"}),
+            text_response("Sorry, I can't do that."),
+        ]
+    )
+    assert loop.run_turn("teleport me") == "Sorry, I can't do that."
+    tool_span = next(s for s in spans(loop) if s["kind"] == "tool_call")
+    assert tool_span["payload"]["error_type"] == "unknown_tool"
+
+
+# -- provider failures -------------------------------------------------------
+
+
+def test_rate_limit_retried_transparently(harness, provider):
+    provider.inject_failure("create_event", RateLimitError(retry_after=0.1))
+    loop, client = harness(
+        [
+            tool_call("create_event", {"title": "Retry me", "start": iso(5), "end": iso(6)}),
+            text_response("Booked."),
+        ]
+    )
+    assert loop.run_turn("book it") == "Booked."
+    tool_span = next(s for s in spans(loop) if s["kind"] == "tool_call")
+    assert tool_span["payload"]["ok"] is True
+    assert tool_span["payload"]["retries"] == 1  # observable in the trace
+
+
+def test_retry_exhaustion_surfaces_gracefully(harness, provider):
+    provider.inject_failure("create_event", lambda: ServerError("still down"), times=5)
+    loop, client = harness(
+        [
+            tool_call("create_event", {"title": "Doomed", "start": iso(5), "end": iso(6)}),
+            text_response("The calendar service is down; I couldn't book it."),
+        ]
+    )
+    reply = loop.run_turn("book it")
+    assert "down" in reply
+    tool_span = next(s for s in spans(loop) if s["kind"] == "tool_call")
+    assert tool_span["payload"]["error_type"] == "provider_unavailable"
+
+
+# -- loop guard ---------------------------------------------------------------
+
+
+def test_loop_guard_bails(harness):
+    loop, client = harness([])
+    client.repeat_forever(tool_call("get_current_datetime", {}))
+    reply = loop.run_turn("loop forever")
+    assert reply == BAIL_MESSAGE
+    llm_calls = [s for s in spans(loop) if s["kind"] == "llm_call"]
+    assert len(llm_calls) == MAX_ITERATIONS
+    assert any(s["name"] == "loop_guard" for s in spans(loop))
+
+
+# -- confirmation gate ---------------------------------------------------------
+
+
+def test_delete_requires_cross_turn_confirmation(harness, provider):
+    event = provider.create_event(ALICE.email, EventDraft(title="Victim", start=at(5), end=at(6)))
+
+    loop, client = harness(
+        [
+            # Turn 1: model tries to delete; gets confirmation_required; tells user.
+            tool_call("delete_event", {"event_id": event.id}),
+            text_response("This will delete 'Victim' at 10:30. Confirm?"),
+            # Turn 2: user said yes; model retries with the token.
+            tool_call("delete_event", {"event_id": event.id, "confirmation_token": "confirm-001"}),
+            text_response("Deleted."),
+        ]
+    )
+
+    reply1 = loop.run_turn("delete the victim meeting")
+    assert "Confirm" in reply1
+    assert provider.list_events(ALICE.email, at(0), at(23))  # still there
+
+    reply2 = loop.run_turn("yes, go ahead")
+    assert reply2 == "Deleted."
+    assert provider.list_events(ALICE.email, at(0), at(23)) == []
+
+
+def test_model_cannot_self_confirm_within_one_turn(harness, provider):
+    event = provider.create_event(ALICE.email, EventDraft(title="Safe", start=at(5), end=at(6)))
+    loop, client = harness(
+        [
+            tool_call("delete_event", {"event_id": event.id}),
+            # model immediately "confirms" itself in the SAME turn
+            tool_call("delete_event", {"event_id": event.id, "confirmation_token": "confirm-001"}),
+            text_response("I tried."),
+        ]
+    )
+    loop.run_turn("delete it")
+    # the second call was rejected: token from the same turn is invalid
+    assert provider.list_events(ALICE.email, at(0), at(23)), "event must survive self-confirm"

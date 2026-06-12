@@ -1,0 +1,461 @@
+"""Agent tool registry: Pydantic-validated args, uniform ToolOutcome results.
+
+Three safety mechanisms live HERE, in code, not in the prompt:
+- Confirmation gate: update/delete first return confirmation_required with a
+  token; the token only validates on a LATER turn (i.e. after the user has
+  actually replied), so the model cannot self-confirm destructive actions.
+- Rule checker hook: create/update times pass through an injected rule
+  checker (the memory module's enforcement layer); violations come back as
+  error_type="rule_violation" regardless of what the prompt said.
+- Provider retry: retryable provider errors (429/5xx) are retried with
+  exponential backoff + jitter before the agent ever sees a failure.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import random
+import time
+from collections.abc import Callable
+from datetime import timedelta
+from typing import Any, Literal
+from zoneinfo import ZoneInfo
+
+from pydantic import BaseModel, Field, ValidationError
+
+from calendai.core.clock import Clock
+from calendai.core.models import (
+    Attendee,
+    EventDraft,
+    EventPatch,
+    FactType,
+    MemoryFact,
+    TimeSlot,
+    ToolOutcome,
+    User,
+    UtcDatetime,
+)
+from calendai.core.provider import CalendarProvider, ProviderError, RateLimitError
+from calendai.db.store import Store
+
+# A rule checker receives the action name and the proposed start/end and
+# returns a human-readable violation message, or None if compliant.
+RuleChecker = Callable[[str, UtcDatetime, UtcDatetime], str | None]
+
+
+# -- argument models (the LLM-facing schemas) ---------------------------
+
+
+class ListEventsArgs(BaseModel):
+    start: UtcDatetime
+    end: UtcDatetime
+
+
+class CreateEventArgs(BaseModel):
+    title: str
+    start: UtcDatetime
+    end: UtcDatetime
+    description: str = ""
+    attendee_emails: list[str] = Field(default_factory=list)
+
+
+class UpdateEventArgs(BaseModel):
+    event_id: str
+    title: str | None = None
+    start: UtcDatetime | None = None
+    end: UtcDatetime | None = None
+    description: str | None = None
+    attendee_emails: list[str] | None = None
+    confirmation_token: str | None = None
+
+
+class DeleteEventArgs(BaseModel):
+    event_id: str
+    confirmation_token: str | None = None
+
+
+class CheckAvailabilityArgs(BaseModel):
+    window_start: UtcDatetime
+    window_end: UtcDatetime
+    duration_minutes: int = Field(gt=0, le=480)
+    attendee_emails: list[str] = Field(default_factory=list)
+
+
+class ResolveContactArgs(BaseModel):
+    name: str
+
+
+class SaveProfileFactArgs(BaseModel):
+    fact_type: Literal["rule", "contact", "preference"]
+    key: str = Field(description="stable identity, e.g. rule:no_meetings_before, contact:alex")
+    value: dict[str, Any]
+    statement: str = Field(description="one human-readable sentence stating the fact")
+
+
+class GetCurrentDatetimeArgs(BaseModel):
+    pass
+
+
+# -- confirmation gate ---------------------------------------------------
+
+
+def _args_fingerprint(payload: dict[str, Any]) -> str:
+    clean = {k: v for k, v in payload.items() if k not in ("confirmation_token", "rationale")}
+    return hashlib.sha256(json.dumps(clean, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+class ConfirmationGate:
+    """Two-step confirmation for destructive actions, enforced in code.
+
+    A token issued on turn N only validates on turn > N, which guarantees a
+    real user message happened in between - the model cannot confirm itself
+    within a single turn.
+    """
+
+    def __init__(self) -> None:
+        self.turn = 0
+        self._pending: dict[str, dict[str, Any]] = {}
+        self._counter = 0
+
+    def new_turn(self) -> None:
+        self.turn += 1
+
+    def request(self, action: str, fingerprint: str) -> str:
+        self._counter += 1
+        token = f"confirm-{self._counter:03d}"
+        self._pending[token] = {"action": action, "fp": fingerprint, "turn": self.turn}
+        return token
+
+    def validate(self, token: str | None, action: str, fingerprint: str) -> bool:
+        if not token or token not in self._pending:
+            return False
+        entry = self._pending[token]
+        if entry["action"] != action or entry["fp"] != fingerprint:
+            return False
+        if entry["turn"] >= self.turn:  # same turn: user never saw it
+            return False
+        del self._pending[token]
+        return True
+
+
+# -- free slot computation (pure, unit-testable) -------------------------
+
+
+def find_free_slots(
+    busy: list[TimeSlot], window_start: UtcDatetime, window_end: UtcDatetime, duration: timedelta
+) -> list[TimeSlot]:
+    """Gaps of at least `duration` inside the window, given merged busy slots
+    from ALL participants combined."""
+    merged: list[TimeSlot] = []
+    for slot in sorted(busy, key=lambda s: s.start):
+        if merged and slot.start <= merged[-1].end:
+            if slot.end > merged[-1].end:
+                merged[-1] = TimeSlot(start=merged[-1].start, end=slot.end)
+        else:
+            merged.append(slot)
+
+    free: list[TimeSlot] = []
+    cursor = window_start
+    for slot in merged:
+        if slot.start - cursor >= duration:
+            free.append(TimeSlot(start=cursor, end=slot.start))
+        cursor = max(cursor, slot.end)
+    if window_end - cursor >= duration:
+        free.append(TimeSlot(start=cursor, end=window_end))
+    return free
+
+
+# -- the toolbox ----------------------------------------------------------
+
+
+class Toolbox:
+    """Executes validated tool calls for one user against one provider."""
+
+    MAX_PROVIDER_RETRIES = 3
+
+    def __init__(
+        self,
+        provider: CalendarProvider,
+        store: Store,
+        user: User,
+        clock: Clock,
+        rule_checker: RuleChecker | None = None,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        rng: random.Random | None = None,
+    ) -> None:
+        self.provider = provider
+        self.store = store
+        self.user = user
+        self.clock = clock
+        self.rule_checker = rule_checker
+        self.gate = ConfirmationGate()
+        self._sleep = sleep_fn
+        self._rng = rng or random.Random(0)
+        self.last_retries = 0  # observability: retries used by the most recent call
+
+    # -- provider retry wrapper --
+
+    def _call_provider(self, fn: Callable[[], Any]) -> Any:
+        self.last_retries = 0
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except ProviderError as exc:
+                if not exc.retryable or attempt >= self.MAX_PROVIDER_RETRIES - 1:
+                    raise
+                # rate limits tell us how long to wait; otherwise exponential backoff
+                delay = exc.retry_after if isinstance(exc, RateLimitError) else (2**attempt) * 0.5
+                self._sleep(delay + self._rng.uniform(0, 0.25))  # jitter
+                attempt += 1
+                self.last_retries = attempt
+
+    @staticmethod
+    def _provider_error(exc: ProviderError) -> ToolOutcome:
+        error_type = {
+            "RateLimitError": "rate_limited",
+            "ServerError": "provider_unavailable",
+            "AuthError": "auth_failed",
+            "NotFoundError": "not_found",
+            "MalformedResponseError": "malformed_response",
+        }.get(type(exc).__name__, "provider_error")
+        return ToolOutcome(ok=False, error=str(exc), error_type=error_type)
+
+    # -- tools --
+
+    def list_events(self, args: ListEventsArgs) -> ToolOutcome:
+        try:
+            events = self._call_provider(
+                lambda: self.provider.list_events(self.user.email, args.start, args.end)
+            )
+        except ProviderError as exc:
+            return self._provider_error(exc)
+        return ToolOutcome(ok=True, data=[e.model_dump(mode="json") for e in events])
+
+    def create_event(self, args: CreateEventArgs) -> ToolOutcome:
+        if self.rule_checker:
+            violation = self.rule_checker("create_event", args.start, args.end)
+            if violation:
+                return ToolOutcome(ok=False, error=violation, error_type="rule_violation")
+        draft = EventDraft(
+            title=args.title,
+            start=args.start,
+            end=args.end,
+            description=args.description,
+            attendees=[Attendee(email=e) for e in args.attendee_emails],
+        )
+        try:
+            event = self._call_provider(lambda: self.provider.create_event(self.user.email, draft))
+        except ProviderError as exc:
+            return self._provider_error(exc)
+        return ToolOutcome(ok=True, data=event.model_dump(mode="json"))
+
+    def update_event(self, args: UpdateEventArgs) -> ToolOutcome:
+        fingerprint = _args_fingerprint(args.model_dump(mode="json"))
+        if not self.gate.validate(args.confirmation_token, "update_event", fingerprint):
+            token = self.gate.request("update_event", fingerprint)
+            return ToolOutcome(
+                ok=False,
+                error_type="confirmation_required",
+                error=(
+                    "Updating an event needs explicit user confirmation. Describe the change, "
+                    f"wait for the user to confirm, then retry with confirmation_token={token!r} "
+                    "and identical arguments."
+                ),
+            )
+        if self.rule_checker and (args.start or args.end):
+            try:
+                current = self._call_provider(
+                    lambda: self.provider.get_event(self.user.email, args.event_id)
+                )
+            except ProviderError as exc:
+                return self._provider_error(exc)
+            new_start = args.start or current.start
+            new_end = args.end or current.end
+            violation = self.rule_checker("update_event", new_start, new_end)
+            if violation:
+                return ToolOutcome(ok=False, error=violation, error_type="rule_violation")
+        patch = EventPatch(
+            title=args.title,
+            start=args.start,
+            end=args.end,
+            description=args.description,
+            attendees=(
+                None
+                if args.attendee_emails is None
+                else [Attendee(email=e) for e in args.attendee_emails]
+            ),
+        )
+        try:
+            event = self._call_provider(
+                lambda: self.provider.update_event(self.user.email, args.event_id, patch)
+            )
+        except ProviderError as exc:
+            return self._provider_error(exc)
+        except ValueError as exc:  # merged-interval validation
+            return ToolOutcome(ok=False, error=str(exc), error_type="invalid_arguments")
+        return ToolOutcome(ok=True, data=event.model_dump(mode="json"))
+
+    def delete_event(self, args: DeleteEventArgs) -> ToolOutcome:
+        fingerprint = _args_fingerprint(args.model_dump(mode="json"))
+        if not self.gate.validate(args.confirmation_token, "delete_event", fingerprint):
+            token = self.gate.request("delete_event", fingerprint)
+            return ToolOutcome(
+                ok=False,
+                error_type="confirmation_required",
+                error=(
+                    "Deleting an event needs explicit user confirmation. Tell the user which "
+                    f"event would be deleted, wait for their confirmation, then retry with "
+                    f"confirmation_token={token!r}."
+                ),
+            )
+        try:
+            self._call_provider(lambda: self.provider.delete_event(self.user.email, args.event_id))
+        except ProviderError as exc:
+            return self._provider_error(exc)
+        return ToolOutcome(ok=True, data={"deleted": args.event_id})
+
+    def check_availability(self, args: CheckAvailabilityArgs) -> ToolOutcome:
+        calendars = [self.user.email, *args.attendee_emails]
+        try:
+            busy_map = self._call_provider(
+                lambda: self.provider.freebusy(calendars, args.window_start, args.window_end)
+            )
+        except ProviderError as exc:
+            return self._provider_error(exc)
+        all_busy = [slot for slots in busy_map.values() for slot in slots]
+        free = find_free_slots(
+            all_busy,
+            args.window_start,
+            args.window_end,
+            timedelta(minutes=args.duration_minutes),
+        )
+        return ToolOutcome(
+            ok=True,
+            data={
+                "free_slots": [s.model_dump(mode="json") for s in free[:5]],
+                "busy": {
+                    cal: [s.model_dump(mode="json") for s in sl] for cal, sl in busy_map.items()
+                },
+            },
+        )
+
+    def resolve_contact(self, args: ResolveContactArgs) -> ToolOutcome:
+        name = args.name.strip().lower()
+        fact_key = f"contact:{name}"
+        for fact in self.store.list_facts(self.user.id, FactType.CONTACT):
+            if fact.key == fact_key:
+                return ToolOutcome(ok=True, data=fact.value)
+        for candidate in self.store.list_users():
+            if candidate.display_name.lower() == name or candidate.email.lower() == name:
+                return ToolOutcome(
+                    ok=True, data={"email": candidate.email, "name": candidate.display_name}
+                )
+        return ToolOutcome(
+            ok=False,
+            error=f"I don't know who {args.name!r} is. Ask the user for their email, then "
+            "save it with save_profile_fact so it is remembered.",
+            error_type="unknown_contact",
+        )
+
+    def save_profile_fact(self, args: SaveProfileFactArgs) -> ToolOutcome:
+        fact = MemoryFact(
+            user_id=self.user.id,
+            fact_type=FactType(args.fact_type),
+            key=args.key,
+            value=args.value,
+            statement=args.statement,
+            provenance=f"saved by agent on turn {self.gate.turn}",
+        )
+        saved = self.store.upsert_fact(fact)
+        return ToolOutcome(ok=True, data={"saved": saved.statement, "key": saved.key})
+
+    def get_current_datetime(self, args: GetCurrentDatetimeArgs) -> ToolOutcome:
+        now = self.clock.now()
+        try:
+            local = now.astimezone(ZoneInfo(self.user.timezone))
+        except KeyError:
+            local = now
+        return ToolOutcome(
+            ok=True,
+            data={
+                "utc": now.isoformat(),
+                "local": local.isoformat(),
+                "timezone": self.user.timezone,
+                "weekday": local.strftime("%A"),
+            },
+        )
+
+
+# -- registry / Anthropic schema ------------------------------------------
+
+_TOOL_DEFS: list[tuple[str, str, type[BaseModel]]] = [
+    ("list_events", "List the user's calendar events in a UTC window.", ListEventsArgs),
+    ("create_event", "Create a calendar event, optionally inviting attendees.", CreateEventArgs),
+    (
+        "update_event",
+        "Update an existing event (destructive: needs user confirmation flow).",
+        UpdateEventArgs,
+    ),
+    (
+        "delete_event",
+        "Delete an event (destructive: needs user confirmation flow).",
+        DeleteEventArgs,
+    ),
+    (
+        "check_availability",
+        "Find free slots across the user's and attendees' calendars.",
+        CheckAvailabilityArgs,
+    ),
+    ("resolve_contact", "Look up a person's email by name from memory.", ResolveContactArgs),
+    (
+        "save_profile_fact",
+        "Persist a lasting rule, contact, or preference to the user's profile.",
+        SaveProfileFactArgs,
+    ),
+    (
+        "get_current_datetime",
+        "Get the current date/time in UTC and the user's timezone.",
+        GetCurrentDatetimeArgs,
+    ),
+]
+
+
+def anthropic_tool_schemas() -> list[dict[str, Any]]:
+    schemas = []
+    for name, description, model in _TOOL_DEFS:
+        schema = model.model_json_schema()
+        schema.setdefault("properties", {})["rationale"] = {
+            "type": "string",
+            "description": "One short sentence: why this call. Logged for audit.",
+        }
+        schemas.append({"name": name, "description": description, "input_schema": schema})
+    return schemas
+
+
+def execute_tool(toolbox: Toolbox, name: str, raw_input: dict[str, Any]) -> ToolOutcome:
+    """Validate and run one tool call. Validation errors come back as
+    ToolOutcome(error_type='invalid_arguments') so the model can self-correct."""
+    handlers: dict[str, tuple[type[BaseModel], Callable[[Any], ToolOutcome]]] = {
+        "list_events": (ListEventsArgs, toolbox.list_events),
+        "create_event": (CreateEventArgs, toolbox.create_event),
+        "update_event": (UpdateEventArgs, toolbox.update_event),
+        "delete_event": (DeleteEventArgs, toolbox.delete_event),
+        "check_availability": (CheckAvailabilityArgs, toolbox.check_availability),
+        "resolve_contact": (ResolveContactArgs, toolbox.resolve_contact),
+        "save_profile_fact": (SaveProfileFactArgs, toolbox.save_profile_fact),
+        "get_current_datetime": (GetCurrentDatetimeArgs, toolbox.get_current_datetime),
+    }
+    if name not in handlers:
+        return ToolOutcome(ok=False, error=f"unknown tool {name!r}", error_type="unknown_tool")
+    args_model, handler = handlers[name]
+    payload = {k: v for k, v in raw_input.items() if k != "rationale"}
+    try:
+        args = args_model(**payload)
+    except ValidationError as exc:
+        compact = "; ".join(
+            f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
+        )
+        return ToolOutcome(ok=False, error=compact, error_type="invalid_arguments")
+    return handler(args)
