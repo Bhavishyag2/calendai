@@ -41,6 +41,7 @@ from calendai.core.models import (
 )
 from calendai.core.provider import CalendarProvider, ProviderError, RateLimitError
 from calendai.db.store import Store
+from calendai.memory.validation import validate_fact
 
 # A rule checker receives the action name and the proposed start/end and
 # returns a human-readable violation message, or None if compliant.
@@ -534,6 +535,12 @@ class Toolbox:
         )
 
     def save_profile_fact(self, args: SaveProfileFactArgs) -> ToolOutcome:
+        problem = validate_fact(args.fact_type, args.key, args.value, args.statement)
+        if problem is not None:
+            # same write-time rules as the episodic extractor: a mis-typed key
+            # (e.g. fact_type="preference" under rule:*) would be invisible to
+            # the RuleEngine while blocking the extractor's repair via dedup
+            return ToolOutcome(ok=False, error=problem, error_type="invalid_arguments")
         fact = MemoryFact(
             user_id=self.user.id,
             fact_type=FactType(args.fact_type),

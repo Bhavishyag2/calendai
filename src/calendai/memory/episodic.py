@@ -23,6 +23,7 @@ from pydantic import BaseModel, ValidationError
 from calendai.core.clock import Clock
 from calendai.core.models import FactType, MemoryFact, User
 from calendai.db.store import Store
+from calendai.memory.validation import validate_fact
 
 MAX_TOKENS = 512
 
@@ -55,9 +56,6 @@ Key patterns and required value shapes:
 If the exchange contains no durable fact, output exactly: []
 """
 
-_KEY_RE = re.compile(r"^(rule|contact|pref):[a-z0-9_]+$")
-_PREFIX_TO_TYPE = {"rule": "rule", "contact": "contact", "pref": "preference"}
-
 
 class ExtractedFact(BaseModel):
     fact_type: Literal["rule", "contact", "preference"]
@@ -77,30 +75,38 @@ class EpisodicExtractor:
     def extract(self, user: User, user_text: str, assistant_text: str) -> list[MemoryFact]:
         """Extract and persist facts from one turn. Returns what was newly saved."""
         self.last_error = None
+        saved: list[MemoryFact] = []
         try:
             raw = self._call_model(user_text, assistant_text)
             candidates = self._parse(raw)
+            existing = {f.key: f for f in self.store.list_facts(user.id)}
+            seen_keys: set[str] = set()  # dedupe within one model reply
+            for cand in candidates:
+                if cand.key in seen_keys:
+                    continue
+                seen_keys.add(cand.key)
+                prior = existing.get(cand.key)
+                if (
+                    prior is not None
+                    and prior.value == cand.value
+                    and prior.fact_type.value == cand.fact_type
+                ):
+                    continue  # already known; don't churn the supersession chain
+                    # (a type mismatch on the same key+value is NOT a dup: it
+                    # supersedes, repairing a mis-typed legacy fact)
+                fact = MemoryFact(
+                    user_id=user.id,
+                    fact_type=FactType(cand.fact_type),
+                    key=cand.key,
+                    value=cand.value,
+                    statement=cand.statement,
+                    provenance=f"auto-extracted from conversation on {self.clock.now().date()}",
+                )
+                saved.append(self.store.upsert_fact(fact))
         except Exception as exc:
             # best-effort by design: the turn already succeeded; the failure
-            # is still visible in the trace via last_error
+            # (model, parsing, OR store) is still visible via the trace span
             self.last_error = f"{type(exc).__name__}: {exc}"
-            return []
-
-        saved: list[MemoryFact] = []
-        existing = {f.key: f for f in self.store.list_facts(user.id)}
-        for cand in candidates:
-            prior = existing.get(cand.key)
-            if prior is not None and prior.value == cand.value:
-                continue  # already known; don't churn the supersession chain
-            fact = MemoryFact(
-                user_id=user.id,
-                fact_type=FactType(cand.fact_type),
-                key=cand.key,
-                value=cand.value,
-                statement=cand.statement,
-                provenance=f"auto-extracted from conversation on {self.clock.now().date()}",
-            )
-            saved.append(self.store.upsert_fact(fact))
         return saved
 
     # -- internals ------------------------------------------------------------
@@ -130,8 +136,7 @@ class EpisodicExtractor:
                 fact = ExtractedFact(**item)
             except (ValidationError, TypeError):
                 continue
-            match = _KEY_RE.match(fact.key)
-            if not match or _PREFIX_TO_TYPE[match.group(1)] != fact.fact_type:
-                continue  # key pattern must agree with the declared type
+            if validate_fact(fact.fact_type, fact.key, fact.value, fact.statement) is not None:
+                continue  # same write-time rules as the save_profile_fact tool
             out.append(fact)
         return out

@@ -115,6 +115,95 @@ def test_engine_wired_into_toolbox_blocks_create(engine, store, provider, clock)
     assert "Never before 10:00" in outcome.error
 
 
+def test_overnight_event_cannot_bypass_before_rule(engine, store):
+    store.upsert_fact(rule("rule:no_meetings_before", {"time": "10:00"}, "Never before 10:00"))
+    # Sun 23:00 IST -> Mon 09:00 IST: starts late but occupies the morning window
+    overnight = engine.check("create_event", at(17, 30, day_offset=-1), at(3, 30))
+    assert overnight is not None
+    # an afternoon event the same days is fine
+    assert engine.check("create_event", at(5, 30), at(6, 30)) is None
+
+
+def test_weekend_rule_blocks_overnight_friday_event(engine, store):
+    store.upsert_fact(rule("rule:no_meetings_on", {"days": ["saturday"]}, "No Saturdays"))
+    # Fri 23:00 IST -> Sat 01:00 IST touches Saturday
+    crossing = engine.check("create_event", at(17, 30, day_offset=4), at(19, 30, day_offset=4))
+    assert crossing is not None and "Saturday" in crossing
+    # Fri 22:00 -> Sat 00:00 IST: half-open end at midnight never touches Saturday
+    upto_midnight = engine.check("create_event", at(16, 30, day_offset=4), at(18, 30, day_offset=4))
+    assert upto_midnight is None
+
+
+def test_invalid_value_timezone_falls_back_to_user_tz(engine, store):
+    # "IST" is not an IANA name; fallback must be the user's tz (Asia/Kolkata),
+    # NOT UTC: at(5) is 10:30 IST (allowed) but 05:00 UTC (would be blocked)
+    store.upsert_fact(
+        rule(
+            "rule:no_meetings_before",
+            {"time": "10:00", "timezone": "IST"},
+            "Never before 10:00",
+        )
+    )
+    assert engine.check("create_event", at(5), at(6)) is None
+
+
+def test_update_event_rule_enforced_after_confirmation(engine, store, provider, clock):
+    from calendai.agent.tools import UpdateEventArgs
+    from calendai.core.models import EventDraft
+
+    store.upsert_fact(rule("rule:no_meetings_before", {"time": "10:00"}, "Never before 10:00"))
+    toolbox = Toolbox(
+        provider=provider,
+        store=store,
+        user=ALICE,
+        clock=clock,
+        rule_checker=engine.check,
+        sleep_fn=lambda _s: None,
+    )
+    event = provider.create_event(ALICE.email, EventDraft(title="Movable", start=at(5), end=at(6)))
+    args = UpdateEventArgs(event_id=event.id, start=at(3), end=at(3, 30))
+
+    toolbox.new_turn("move it earlier")
+    first = toolbox.update_event(args)
+    assert first.error_type == "confirmation_required"
+    token = next(iter(toolbox.gate.pending()))
+    toolbox.new_turn("yes")
+    confirmed = toolbox.update_event(
+        UpdateEventArgs(event_id=event.id, start=at(3), end=at(3, 30), confirmation_token=token)
+    )
+    # user consent does not override the stored rule - code wins
+    assert not confirmed.ok and confirmed.error_type == "rule_violation"
+
+
+def test_save_tool_rejects_mistyped_key(store, provider, clock):
+    store.upsert_user(ALICE)
+    toolbox = Toolbox(
+        provider=provider, store=store, user=ALICE, clock=clock, sleep_fn=lambda _s: None
+    )
+    from calendai.agent.tools import SaveProfileFactArgs
+
+    mistyped = toolbox.save_profile_fact(
+        SaveProfileFactArgs(
+            fact_type="preference",  # poisoned: rule:* key under preference type
+            key="rule:no_meetings_before",
+            value={"time": "10:00"},
+            statement="Never before 10:00",
+        )
+    )
+    assert not mistyped.ok and mistyped.error_type == "invalid_arguments"
+    assert store.list_facts(ALICE.id) == []
+
+    oversized = toolbox.save_profile_fact(
+        SaveProfileFactArgs(
+            fact_type="rule",
+            key="rule:no_meetings_before",
+            value={"time": "10:00"},
+            statement="x" * 300,
+        )
+    )
+    assert not oversized.ok and oversized.error_type == "invalid_arguments"
+
+
 # -- profile ordering -------------------------------------------------------------
 
 
@@ -239,6 +328,65 @@ def test_changed_value_supersedes(extractor_for, store):
     assert len(active) == 1 and active[0].value["time"] == "11:00"
 
 
+def test_duplicate_candidates_in_one_reply_saved_once(extractor_for, store):
+    item = json.loads(RULE_REPLY)[0]
+    doubled = json.dumps([item, item])
+    saved = extractor_for(doubled).extract(ALICE, "never before 10", "ok")
+    assert len(saved) == 1
+    assert len(store.list_facts(ALICE.id, FactType.RULE, active_only=False)) == 1
+
+
+def test_same_turn_tool_save_then_extractor_dedups(store, provider, clock):
+    store.upsert_user(ALICE)
+    toolbox = Toolbox(
+        provider=provider, store=store, user=ALICE, clock=clock, sleep_fn=lambda _s: None
+    )
+    from calendai.agent.tools import SaveProfileFactArgs
+
+    # the agent saved it via the tool mid-turn...
+    toolbox.save_profile_fact(
+        SaveProfileFactArgs(
+            fact_type="rule",
+            key="rule:no_meetings_before",
+            value={"time": "10:00", "timezone": "Asia/Kolkata"},
+            statement="Never before 10:00 IST.",
+        )
+    )
+    # ...then post-turn extraction emits the same fact: no second version
+    saved = EpisodicExtractor(utility(RULE_REPLY), "scripted-utility", store, clock).extract(
+        ALICE, "never book me before 10am", "Saved!"
+    )
+    assert saved == []
+    assert len(store.list_facts(ALICE.id, FactType.RULE, active_only=False)) == 1
+
+
+def test_extractor_repairs_mistyped_legacy_fact(extractor_for, store):
+    # a poisoned legacy row (inserted directly, bypassing write validation)
+    store.upsert_fact(
+        MemoryFact(
+            user_id=ALICE.id,
+            fact_type=FactType.PREFERENCE,
+            key="rule:no_meetings_before",
+            value={"time": "10:00", "timezone": "Asia/Kolkata"},
+            statement="mistyped",
+            provenance="legacy",
+        )
+    )
+    saved = extractor_for(RULE_REPLY).extract(ALICE, "never before 10am", "ok")
+    assert len(saved) == 1  # same key+value but WRONG type: supersedes, not dedup
+    active = store.list_facts(ALICE.id, FactType.RULE)
+    assert len(active) == 1 and active[0].key == "rule:no_meetings_before"
+
+
+def test_store_failure_never_breaks_turn(store, clock):
+    store.upsert_user(ALICE)
+    extractor = EpisodicExtractor(utility(RULE_REPLY), "scripted-utility", store, clock)
+    store.close()  # simulate a dead database under the extractor
+    saved = extractor.extract(ALICE, "never before 10", "ok")
+    assert saved == []
+    assert extractor.last_error is not None
+
+
 # -- loop integration ------------------------------------------------------------
 
 
@@ -265,6 +413,30 @@ def test_loop_runs_extraction_post_turn_with_trace(provider, store, clock):
     spans = tracer.spans_for(loop.last_request_id)
     mem = next(s for s in spans if s["kind"] == "memory_op")
     assert mem["payload"]["extracted_keys"] == ["rule:no_meetings_before"]
+    assert mem["payload"]["error"] is None
+
+
+def test_extractor_error_lands_in_trace_span(provider, store, clock):
+    store.upsert_user(ALICE)
+    agent_client = ScriptedClient([text_response("Hi!")])
+    toolbox = Toolbox(
+        provider=provider, store=store, user=ALICE, clock=clock, sleep_fn=lambda _s: None
+    )
+    tracer = SQLiteTraceEmitter(store, clock=clock)
+    broken_utility = ScriptedClient([RuntimeError("utility model down")])
+    loop = AgentLoop(
+        client=agent_client,
+        model="scripted-model",
+        toolbox=toolbox,
+        store=store,
+        tracer=tracer,
+        clock=clock,
+        user=ALICE,
+        extractor=EpisodicExtractor(broken_utility, "scripted-utility", store, clock),
+    )
+    assert loop.run_turn("hello") == "Hi!"  # the turn survives
+    mem = next(s for s in tracer.spans_for(loop.last_request_id) if s["kind"] == "memory_op")
+    assert "RuntimeError" in mem["payload"]["error"]
 
 
 # -- the headline: memory survives a restart ------------------------------------------

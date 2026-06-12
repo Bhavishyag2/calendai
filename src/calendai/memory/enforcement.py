@@ -7,33 +7,52 @@ enforced on the very next tool call), parses the structured `value` payload -
 never the free-text statement - and vetoes non-compliant create/update calls
 at the tool layer with error_type="rule_violation".
 
+Rules use INTERVAL-OVERLAP semantics: an event violates "no meetings before
+10:00" if ANY part of it falls before 10:00 local - a 23:00-09:00 overnight
+event cannot sneak past a start-time-only check. Likewise "no Saturdays"
+blocks a Friday 23:00 - Saturday 01:00 event.
+
 Rule keys enforceable in code (the registry below). A rule fact with any
 other key, or with a malformed value, is skipped here: it still reaches the
-model through the system prompt, it just has no code-level teeth.
+model through the system prompt, it just has no code-level teeth. Canonical
+keys are shape-validated at write time (memory/validation.py), so malformed
+canonical rules should not exist in practice.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from datetime import time as dt_time
 from zoneinfo import ZoneInfo
 
 from calendai.core.models import FactType, MemoryFact, User, UtcDatetime
 from calendai.db.store import Store
+from calendai.memory.validation import _WEEKDAYS, parse_hhmm
 
-_WEEKDAYS = {
-    "monday",
-    "tuesday",
-    "wednesday",
-    "thursday",
-    "friday",
-    "saturday",
-    "sunday",
-}
+_MAX_WINDOW_DAYS = 370  # iteration cap for absurdly long events; beyond it we just block
 
 
-def _parse_hhmm(raw: str) -> dt_time:
-    hour, minute = raw.strip().split(":")
-    return dt_time(int(hour), int(minute))
+def _overlaps_daily_window(
+    local_start: datetime, local_end: datetime, win_start: dt_time, win_end: dt_time | None
+) -> bool:
+    """Does the half-open event [start, end) touch the daily window
+    [win_start, win_end) on any day it spans? win_end=None means midnight
+    (end of day). Datetimes must already be in the rule's timezone."""
+    if (local_end - local_start).days > _MAX_WINDOW_DAYS:
+        return True  # multi-year event: certainly overlaps; avoid silly loops
+    tz = local_start.tzinfo
+    day = local_start.date()
+    while day <= local_end.date():
+        w0 = datetime.combine(day, win_start, tzinfo=tz)
+        w1 = (
+            datetime.combine(day + timedelta(days=1), dt_time(0, 0), tzinfo=tz)
+            if win_end is None
+            else datetime.combine(day, win_end, tzinfo=tz)
+        )
+        if local_start < w1 and local_end > w0:
+            return True
+        day += timedelta(days=1)
+    return False
 
 
 class RuleEngine:
@@ -66,22 +85,26 @@ class RuleEngine:
     # -- per-rule checkers ----------------------------------------------------
 
     def _tz(self, fact: MemoryFact) -> ZoneInfo:
-        name = fact.value.get("timezone") or self.user.timezone
-        try:
-            return ZoneInfo(name)
-        except KeyError:
-            return ZoneInfo("UTC")
+        # fallback order: rule's own timezone -> user's timezone -> UTC
+        for name in (fact.value.get("timezone"), self.user.timezone):
+            if name:
+                try:
+                    return ZoneInfo(name)
+                except (KeyError, ValueError):
+                    continue
+        return ZoneInfo("UTC")
 
     def _no_meetings_before(
         self, fact: MemoryFact, start: UtcDatetime, end: UtcDatetime
     ) -> str | None:
         tz = self._tz(fact)
-        limit = _parse_hhmm(fact.value["time"])
-        local = start.astimezone(tz)
-        if local.time() < limit:
+        limit = parse_hhmm(fact.value["time"])
+        local_start, local_end = start.astimezone(tz), end.astimezone(tz)
+        if _overlaps_daily_window(local_start, local_end, dt_time(0, 0), limit):
             return (
-                f"it would start at {local.strftime('%H:%M')} {tz.key}, "
-                f"before the {fact.value['time']} cutoff."
+                f"it would occupy time before the {fact.value['time']} {tz.key} cutoff "
+                f"(event runs {local_start.strftime('%a %H:%M')} - "
+                f"{local_end.strftime('%a %H:%M')} local)."
             )
         return None
 
@@ -89,29 +112,40 @@ class RuleEngine:
         self, fact: MemoryFact, start: UtcDatetime, end: UtcDatetime
     ) -> str | None:
         tz = self._tz(fact)
-        limit = _parse_hhmm(fact.value["time"])
-        local = end.astimezone(tz)
-        if local.time() > limit or local.date() > start.astimezone(tz).date():
+        limit = parse_hhmm(fact.value["time"])
+        local_start, local_end = start.astimezone(tz), end.astimezone(tz)
+        if _overlaps_daily_window(local_start, local_end, limit, None):
             return (
-                f"it would end at {local.strftime('%H:%M')} {tz.key}, "
-                f"after the {fact.value['time']} cutoff."
+                f"it would occupy time after the {fact.value['time']} {tz.key} cutoff "
+                f"(event runs {local_start.strftime('%a %H:%M')} - "
+                f"{local_end.strftime('%a %H:%M')} local)."
             )
         return None
 
     def _no_meetings_on(self, fact: MemoryFact, start: UtcDatetime, end: UtcDatetime) -> str | None:
-        days = {str(d).lower() for d in fact.value["days"]} & _WEEKDAYS
+        days = {str(d).strip().lower() for d in fact.value["days"]} & _WEEKDAYS
         if not days:
             raise ValueError("no valid weekday names")
         tz = self._tz(fact)
-        weekday = start.astimezone(tz).strftime("%A").lower()
-        if weekday in days:
-            return f"it falls on a {weekday.capitalize()}, which is blocked."
+        local_start, local_end = start.astimezone(tz), end.astimezone(tz)
+        # every local date the half-open event actually touches
+        last_touched = (local_end - timedelta(microseconds=1)).date()
+        day = local_start.date()
+        while day <= last_touched:
+            weekday = day.strftime("%A").lower()
+            if weekday in days:
+                return f"it falls on a {weekday.capitalize()}, which is blocked."
+            day += timedelta(days=1)
+            if (day - local_start.date()).days > _MAX_WINDOW_DAYS:
+                return "it spans more than a year, which certainly hits a blocked day."
         return None
 
     def _max_meeting_minutes(
         self, fact: MemoryFact, start: UtcDatetime, end: UtcDatetime
     ) -> str | None:
         limit = int(fact.value["minutes"])
+        if limit <= 0:
+            raise ValueError("minutes must be positive")
         duration = (end - start).total_seconds() / 60
         if duration > limit:
             return f"it would run {duration:.0f} minutes, over the {limit}-minute cap."
