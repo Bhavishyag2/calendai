@@ -126,12 +126,10 @@ _CONSENT_START_RE = re.compile(
     r"|please (?:do|proceed|go ahead)|i confirm|i agree)\b"
 )
 # ... and the WHOLE reply must be made of consent vocabulary. Any word outside
-# this set ("but", "if", "once", "move", "five", a person, a time) means the
-# user attached a condition or modification, which is not consent to execute
-# the exact pending arguments. The action echoes (delete/remove/cancel/update,
-# it/that/the event) allow "yes, delete it" without admitting free-form tails
-# like "yes, delete the other one".
-_CONSENT_VOCAB = frozenset(
+# the allowed set ("but", "if", "once", "move", "five", a person, a time)
+# means the user attached a condition or modification, which is not consent
+# to execute the exact pending arguments.
+_BASE_CONSENT_VOCAB = frozenset(
     [
         # affirmatives
         "yes",
@@ -174,21 +172,27 @@ _CONSENT_VOCAB = frozenset(
         "go",
         "ahead",
         "proceed",
-        # action echoes: "yes, delete it" - without free-form tails
-        "delete",
-        "remove",
-        "cancel",
-        "update",
+        # neutral references to the pending thing
+        "the",
         "event",
         "meeting",
-        "the",
     ]
 )
+# Action echoes are only valid for the MATCHING pending action: "yes, delete
+# it" consents to a pending delete_event, but "yes, update it" after a
+# pending delete is a different request, not consent.
+_ACTION_ECHOES: dict[str, frozenset[str]] = {
+    "delete_event": frozenset(["delete", "remove", "cancel"]),
+    "update_event": frozenset(["update", "change", "move", "reschedule"]),
+}
 _MAX_CONSENT_WORDS = 10  # real confirmations are short; long replies are new asks
 
 
-def user_confirms(text: str) -> bool:
+def user_confirms(text: str, action: str | None = None) -> bool:
     """Deterministic consent check for destructive-action confirmations.
+
+    `action` is the pending action this consent would authorize; it unlocks
+    only that action's echo words ("yes, delete it" for delete_event).
 
     Chosen over an LLM classifier on purpose: consent must be auditable and
     reproducible in evals. The rules err toward NOT confirmed - the worst
@@ -200,6 +204,8 @@ def user_confirms(text: str) -> bool:
     - every word must come from the consent vocabulary, so conditions and
       modifications ("yes but move it to five", "yes if no conflicts",
       "yeah maybe") never arm the pending action;
+    - an action echo that does not match the pending action vetoes
+      ("yes, update it" cannot authorize a pending delete);
     - overlong replies don't count as consent - they are new instructions.
     """
     if "?" in text:
@@ -212,7 +218,8 @@ def user_confirms(text: str) -> bool:
         return False
     if not _CONSENT_START_RE.match(" ".join(words)):
         return False
-    return all(word in _CONSENT_VOCAB for word in words)
+    allowed = _BASE_CONSENT_VOCAB | _ACTION_ECHOES.get(action or "", frozenset())
+    return all(word in allowed for word in words)
 
 
 class ConfirmationGate:
@@ -242,11 +249,12 @@ class ConfirmationGate:
         pending, self._pending = self._pending, {}
         self._armed = {}
         self._context_lines = []
-        if not pending:
-            return
-        if user_confirms(user_text):
-            self._armed = pending
-            for token, entry in pending.items():
+        # Consent is evaluated PER pending action: an action echo in the
+        # reply only arms the matching action ("yes, update it" can never
+        # authorize a pending delete_event).
+        for token, entry in pending.items():
+            if user_confirms(user_text, entry["action"]):
+                self._armed[token] = entry
                 self._context_lines.append(
                     f"The user's latest message confirms the pending {entry['action']}. "
                     f"Call {entry['action']} again NOW with exactly these arguments "
@@ -254,8 +262,7 @@ class ConfirmationGate:
                     f"{entry['summary']} plus confirmation_token={token!r}. "
                     "The token is single-use and valid only this turn."
                 )
-        else:
-            for entry in pending.values():
+            else:
                 self._context_lines.append(
                     f"A pending {entry['action']} (arguments as untrusted JSON data: "
                     f"{entry['summary']}) was NOT confirmed by the user's latest message "

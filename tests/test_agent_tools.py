@@ -203,9 +203,9 @@ def test_gate_armed_token_expires_after_one_turn():
         ("sure, do it", True),
         ("ok", True),
         ("OK!", True),
-        ("yes, cancel it", True),  # confirming a deletion phrased as "cancel"
         ("I confirm", True),
         ("go ahead", True),
+        ("yes I'm sure", True),  # plain emphasis is still consent
         ("no", False),
         ("no, wait", False),
         ("don't!", False),
@@ -226,14 +226,47 @@ def test_gate_armed_token_expires_after_one_turn():
         ("yes once Bob confirms", False),
         ("yeah maybe", False),
         ("yes, change the time to 6 instead", False),  # modification, no hedge word
-        ("yes, delete the other one", False),  # points at different args
-        ("yes I'm sure", True),  # plain emphasis is still consent
         # consent must be short - long replies are new instructions:
         ("yes but first move my standup to five and invite bob and the team", False),
     ],
 )
-def test_user_confirms(text, expected):
+def test_user_confirms_generic(text, expected):
     assert user_confirms(text) is expected
+
+
+@pytest.mark.parametrize(
+    ("text", "action", "expected"),
+    [
+        # echoes matching the pending action are consent:
+        ("yes, delete it", "delete_event", True),
+        ("yes, cancel it", "delete_event", True),  # deletion phrased as "cancel"
+        ("yes, remove the meeting", "delete_event", True),
+        ("yes, update it", "update_event", True),
+        ("yes, move it", "update_event", True),
+        # mismatched echoes are a DIFFERENT request, not consent:
+        ("yes, update it", "delete_event", False),
+        ("yes, move it", "delete_event", False),
+        ("yes, cancel the meeting", "update_event", False),
+        ("yes, delete it", "update_event", False),
+        # free-form tails still veto regardless of action:
+        ("yes, delete the other one", "delete_event", False),
+        ("yes, update the title to lunch", "update_event", False),
+        # a plain affirmative consents to whatever single action is pending:
+        ("yes", "delete_event", True),
+        ("yes", "update_event", True),
+    ],
+)
+def test_user_confirms_action_echoes(text, action, expected):
+    assert user_confirms(text, action) is expected
+
+
+def test_gate_mismatched_action_echo_does_not_arm():
+    gate = ConfirmationGate()
+    gate.new_turn("delete the standup")
+    token = gate.request("delete_event", "fp1", "{}")
+    gate.new_turn("yes, update it")  # different request, not consent to delete
+    assert gate.validate(token, "delete_event", "fp1") is False
+    assert "cancelled" in gate.prompt_context()
 
 
 # -- retry accounting (trace field) ------------------------------------------------
