@@ -288,6 +288,26 @@ def test_llm_exception_leaves_history_clean(harness, store):
     assert roles == ["user", "user", "assistant"]
 
 
+def test_loop_guard_bail_discloses_saved_facts(harness):
+    loop, client = harness(
+        [
+            tool_call(
+                "save_profile_fact",
+                {
+                    "fact_type": "rule",
+                    "key": "rule:no_meetings_before",
+                    "value": {"time": "10:00"},
+                    "statement": "Never schedule before 10:00",
+                },
+            )
+        ]
+    )
+    client.repeat_forever(tool_call("get_current_datetime", {}))
+    reply = loop.run_turn("remember: no meetings before 10, and then loop forever")
+    assert reply != BAIL_MESSAGE  # memory writes are mutations too
+    assert "rule:no_meetings_before" in reply
+
+
 def test_loop_guard_bail_discloses_partial_changes(harness, provider):
     loop, client = harness(
         [tool_call("create_event", {"title": "Halfway", "start": iso(5), "end": iso(6)})]
