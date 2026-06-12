@@ -39,7 +39,7 @@ def tool_call(name: str, tool_input: dict[str, Any], text: str | None = None) ->
 
 
 class ScriptedClient:
-    def __init__(self, responses: list[SimpleNamespace]) -> None:
+    def __init__(self, responses: list[Any]) -> None:
         self._responses = list(responses)
         self.calls: list[dict[str, Any]] = []
         self.messages = self  # so client.messages.create resolves here
@@ -50,14 +50,25 @@ class ScriptedClient:
         self.calls.append(copy.deepcopy(kwargs))
         if not self._responses:
             raise AssertionError("ScriptedClient ran out of scripted responses")
-        return self._responses.pop(0)
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):  # scripted API failure
+            raise response
+        return response
+
+    def queue(self, *responses: Any) -> ScriptedClient:
+        """Append responses mid-test - e.g. after extracting a real
+        confirmation token from an earlier turn."""
+        self._responses.extend(responses)
+        return self
 
     def repeat_forever(self, response: SimpleNamespace) -> ScriptedClient:
-        """Make every remaining call return `response` (loop-guard tests)."""
+        """After any already-queued responses are consumed, every further
+        call returns `response` (loop-guard tests)."""
+        queued = list(self._responses)
 
         class _Repeater(list):
             def pop(self, _index: int = 0) -> SimpleNamespace:  # type: ignore[override]
-                return response
+                return queued.pop(0) if queued else response
 
             def __bool__(self) -> bool:
                 return True

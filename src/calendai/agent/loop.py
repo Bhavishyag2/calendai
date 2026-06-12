@@ -29,7 +29,7 @@ HISTORY_LIMIT = 20
 
 BAIL_MESSAGE = (
     "I wasn't able to finish that request - I hit my internal step limit. "
-    "Nothing further was changed. Could you rephrase or split the request?"
+    "Nothing was changed. Could you rephrase or split the request?"
 )
 
 
@@ -60,7 +60,9 @@ class AgentLoop:
         request_id = new_request_id(self.clock)
         self.last_request_id = request_id
         self.tracer.begin_request(request_id, self.user.id, user_text)
-        self.toolbox.gate.new_turn()
+        # Evaluates consent for any pending confirmation against the user's
+        # actual words, BEFORE the prompt is built below.
+        self.toolbox.new_turn(user_text)
 
         self.store.add_message(self.user.id, "user", user_text)
         messages: list[dict[str, Any]] = [
@@ -68,10 +70,18 @@ class AgentLoop:
             for m in self.store.recent_messages(self.user.id, limit=HISTORY_LIMIT)
         ]
 
-        system = build_system_prompt(self.user, self.clock, self.store.list_facts(self.user.id))
+        system = build_system_prompt(
+            self.user,
+            self.clock,
+            self.store.list_facts(self.user.id),
+            confirmation_context=self.toolbox.gate.prompt_context(),
+        )
         tools = anthropic_tool_schemas()
 
-        final_text = BAIL_MESSAGE
+        # Stays None unless the turn ends on purpose (final reply or loop-guard
+        # bail). If an exception escapes, the user never saw a reply, so no
+        # assistant message may enter history - but the trace is still closed.
+        final_text: str | None = None
         try:
             for _ in range(MAX_ITERATIONS):
                 response = self._llm_call(request_id, system, tools, messages)
@@ -84,10 +94,23 @@ class AgentLoop:
             else:
                 with self.tracer.span(request_id, SpanKind.DECISION, "loop_guard") as span:
                     span.rationale = f"hit MAX_ITERATIONS={MAX_ITERATIONS}; bailing gracefully"
+                final_text = self._bail_message()
+            return final_text
         finally:
-            self.store.add_message(self.user.id, "assistant", final_text)
+            if final_text is not None:
+                self.store.add_message(self.user.id, "assistant", final_text)
             self.tracer.end_request(request_id)
-        return final_text
+
+    def _bail_message(self) -> str:
+        """Loop-guard bail text; honest about mutations already applied."""
+        mutations = self.toolbox.mutations_this_turn
+        if not mutations:
+            return BAIL_MESSAGE
+        return (
+            "I hit my internal step limit before finishing. Heads up - these changes "
+            f"were already applied: {'; '.join(mutations)}. Please review and tell me "
+            "how you'd like to proceed."
+        )
 
     # -- internals -----------------------------------------------------------
 

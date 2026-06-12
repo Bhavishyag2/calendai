@@ -2,8 +2,10 @@
 
 Three safety mechanisms live HERE, in code, not in the prompt:
 - Confirmation gate: update/delete first return confirmation_required with a
-  token; the token only validates on a LATER turn (i.e. after the user has
-  actually replied), so the model cannot self-confirm destructive actions.
+  token; the token is only armed if the user's NEXT message explicitly
+  confirms (checked deterministically in code), so the model cannot
+  self-confirm destructive actions, and "no" or an unrelated reply revokes
+  the pending request entirely.
 - Rule checker hook: create/update times pass through an injected rule
   checker (the memory module's enforcement layer); violations come back as
   error_type="rule_violation" regardless of what the prompt said.
@@ -16,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+import re
 import time
 from collections.abc import Callable
 from datetime import timedelta
@@ -100,43 +103,108 @@ class GetCurrentDatetimeArgs(BaseModel):
 # -- confirmation gate ---------------------------------------------------
 
 
-def _args_fingerprint(payload: dict[str, Any]) -> str:
+def _canonical_args(payload: dict[str, Any]) -> str:
     clean = {k: v for k, v in payload.items() if k not in ("confirmation_token", "rationale")}
-    return hashlib.sha256(json.dumps(clean, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    return json.dumps(clean, sort_keys=True, default=str)
+
+
+def _args_fingerprint(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_args(payload).encode()).hexdigest()[:16]
+
+
+# "cancel" is deliberately NOT a decline word: "yes, cancel it" is how users
+# confirm a deletion. Decline always overrides confirm.
+_DECLINE_RE = re.compile(
+    r"\b(no|not|nope|nah|don'?t|stop|abort|never\s?mind|hold (?:on|off)|wait)\b",
+    re.IGNORECASE,
+)
+_CONFIRM_RE = re.compile(
+    r"\b(yes|yeah|yep|yup|sure|ok(?:ay)?|confirm(?:ed)?|go ahead|do it|proceed"
+    r"|please do|sounds good|approved?)\b",
+    re.IGNORECASE,
+)
+
+
+def user_confirms(text: str) -> bool:
+    """Deterministic consent check for destructive-action confirmations.
+
+    Chosen over an LLM classifier on purpose: consent must be auditable and
+    reproducible in evals. Anything ambiguous or unrelated counts as NOT
+    confirmed - the worst case of a misread is that the agent asks again.
+    """
+    if _DECLINE_RE.search(text):
+        return False
+    return _CONFIRM_RE.search(text) is not None
 
 
 class ConfirmationGate:
     """Two-step confirmation for destructive actions, enforced in code.
 
-    A token issued on turn N only validates on turn > N, which guarantees a
-    real user message happened in between - the model cannot confirm itself
-    within a single turn.
+    Token lifecycle:
+    1. Turn N: a destructive call without a token issues one and returns
+       confirmation_required. Tool exchanges are not persisted in chat
+       history, so the loop injects the pending action (args + token) into
+       the NEXT turn's system prompt - that is how the model recovers it.
+    2. Turn N+1: the gate inspects the user's actual reply in code. Only an
+       explicit affirmative arms the token; "no" or an unrelated message
+       cancels it. The model can never confirm on the user's behalf.
+    3. An armed token validates once, only for the identical action + args,
+       and only during that one turn.
     """
 
     def __init__(self) -> None:
         self.turn = 0
-        self._pending: dict[str, dict[str, Any]] = {}
         self._counter = 0
+        self._pending: dict[str, dict[str, Any]] = {}  # issued this turn
+        self._armed: dict[str, dict[str, Any]] = {}  # user-consented; this turn only
+        self._context_lines: list[str] = []
 
-    def new_turn(self) -> None:
+    def new_turn(self, user_text: str = "") -> None:
         self.turn += 1
+        pending, self._pending = self._pending, {}
+        self._armed = {}
+        self._context_lines = []
+        if not pending:
+            return
+        if user_confirms(user_text):
+            self._armed = pending
+            for token, entry in pending.items():
+                self._context_lines.append(
+                    f"The user's latest message confirms the pending {entry['action']}. "
+                    f"Call {entry['action']} again NOW with exactly these arguments: "
+                    f"{entry['summary']} plus confirmation_token={token!r}. "
+                    "The token is single-use and valid only this turn."
+                )
+        else:
+            for entry in pending.values():
+                self._context_lines.append(
+                    f"A pending {entry['action']} ({entry['summary']}) was NOT confirmed "
+                    "by the user's latest message and has been cancelled. Do not perform "
+                    "it. If the user asks for it again, the confirmation flow restarts."
+                )
 
-    def request(self, action: str, fingerprint: str) -> str:
+    def request(self, action: str, fingerprint: str, summary: str) -> str:
         self._counter += 1
         token = f"confirm-{self._counter:03d}"
-        self._pending[token] = {"action": action, "fp": fingerprint, "turn": self.turn}
+        self._pending[token] = {"action": action, "fp": fingerprint, "summary": summary}
         return token
 
     def validate(self, token: str | None, action: str, fingerprint: str) -> bool:
-        if not token or token not in self._pending:
+        if not token:
             return False
-        entry = self._pending[token]
-        if entry["action"] != action or entry["fp"] != fingerprint:
+        entry = self._armed.get(token)
+        if entry is None or entry["action"] != action or entry["fp"] != fingerprint:
             return False
-        if entry["turn"] >= self.turn:  # same turn: user never saw it
-            return False
-        del self._pending[token]
+        del self._armed[token]  # single-use
         return True
+
+    def pending(self) -> dict[str, dict[str, Any]]:
+        """Tokens issued this turn, keyed by token (observability + tests)."""
+        return {t: dict(e) for t, e in self._pending.items()}
+
+    def prompt_context(self) -> str:
+        """Lines for the system prompt describing this turn's consent state."""
+        return "\n".join(self._context_lines)
 
 
 # -- free slot computation (pure, unit-testable) -------------------------
@@ -172,7 +240,7 @@ def find_free_slots(
 class Toolbox:
     """Executes validated tool calls for one user against one provider."""
 
-    MAX_PROVIDER_RETRIES = 3
+    MAX_PROVIDER_ATTEMPTS = 3  # total attempts: 1 initial + up to 2 retries
 
     def __init__(
         self,
@@ -192,24 +260,32 @@ class Toolbox:
         self.gate = ConfirmationGate()
         self._sleep = sleep_fn
         self._rng = rng or random.Random(0)
-        self.last_retries = 0  # observability: retries used by the most recent call
+        # observability: total provider retries within the current tool call;
+        # reset by execute_tool so it can never go stale across calls.
+        self.last_retries = 0
+        # successful mutations this turn, for an honest loop-guard bail message
+        self.mutations_this_turn: list[str] = []
+
+    def new_turn(self, user_text: str = "") -> None:
+        """Reset per-turn state; the loop calls this with the user's raw message."""
+        self.mutations_this_turn = []
+        self.gate.new_turn(user_text)
 
     # -- provider retry wrapper --
 
     def _call_provider(self, fn: Callable[[], Any]) -> Any:
-        self.last_retries = 0
         attempt = 0
         while True:
             try:
                 return fn()
             except ProviderError as exc:
-                if not exc.retryable or attempt >= self.MAX_PROVIDER_RETRIES - 1:
+                if not exc.retryable or attempt >= self.MAX_PROVIDER_ATTEMPTS - 1:
                     raise
                 # rate limits tell us how long to wait; otherwise exponential backoff
                 delay = exc.retry_after if isinstance(exc, RateLimitError) else (2**attempt) * 0.5
                 self._sleep(delay + self._rng.uniform(0, 0.25))  # jitter
                 attempt += 1
-                self.last_retries = attempt
+                self.last_retries += 1  # accumulates across provider calls in one tool
 
     @staticmethod
     def _provider_error(exc: ProviderError) -> ToolOutcome:
@@ -249,19 +325,21 @@ class Toolbox:
             event = self._call_provider(lambda: self.provider.create_event(self.user.email, draft))
         except ProviderError as exc:
             return self._provider_error(exc)
+        self.mutations_this_turn.append(f"created event {event.title!r} ({event.id})")
         return ToolOutcome(ok=True, data=event.model_dump(mode="json"))
 
     def update_event(self, args: UpdateEventArgs) -> ToolOutcome:
-        fingerprint = _args_fingerprint(args.model_dump(mode="json"))
+        canonical = args.model_dump(mode="json")
+        fingerprint = _args_fingerprint(canonical)
         if not self.gate.validate(args.confirmation_token, "update_event", fingerprint):
-            token = self.gate.request("update_event", fingerprint)
+            token = self.gate.request("update_event", fingerprint, _canonical_args(canonical))
             return ToolOutcome(
                 ok=False,
                 error_type="confirmation_required",
                 error=(
-                    "Updating an event needs explicit user confirmation. Describe the change, "
-                    f"wait for the user to confirm, then retry with confirmation_token={token!r} "
-                    "and identical arguments."
+                    "Updating an event needs explicit user confirmation. Describe the exact "
+                    "change to the user and stop. If they confirm in their next message, the "
+                    f"system prompt will instruct you to retry with token {token!r}."
                 ),
             )
         if self.rule_checker and (args.start or args.end):
@@ -295,25 +373,28 @@ class Toolbox:
             return self._provider_error(exc)
         except ValueError as exc:  # merged-interval validation
             return ToolOutcome(ok=False, error=str(exc), error_type="invalid_arguments")
+        self.mutations_this_turn.append(f"updated event {event.id}")
         return ToolOutcome(ok=True, data=event.model_dump(mode="json"))
 
     def delete_event(self, args: DeleteEventArgs) -> ToolOutcome:
-        fingerprint = _args_fingerprint(args.model_dump(mode="json"))
+        canonical = args.model_dump(mode="json")
+        fingerprint = _args_fingerprint(canonical)
         if not self.gate.validate(args.confirmation_token, "delete_event", fingerprint):
-            token = self.gate.request("delete_event", fingerprint)
+            token = self.gate.request("delete_event", fingerprint, _canonical_args(canonical))
             return ToolOutcome(
                 ok=False,
                 error_type="confirmation_required",
                 error=(
                     "Deleting an event needs explicit user confirmation. Tell the user which "
-                    f"event would be deleted, wait for their confirmation, then retry with "
-                    f"confirmation_token={token!r}."
+                    "event would be deleted and stop. If they confirm in their next message, "
+                    f"the system prompt will instruct you to retry with token {token!r}."
                 ),
             )
         try:
             self._call_provider(lambda: self.provider.delete_event(self.user.email, args.event_id))
         except ProviderError as exc:
             return self._provider_error(exc)
+        self.mutations_this_turn.append(f"deleted event {args.event_id}")
         return ToolOutcome(ok=True, data={"deleted": args.event_id})
 
     def check_availability(self, args: CheckAvailabilityArgs) -> ToolOutcome:
@@ -447,6 +528,7 @@ def execute_tool(toolbox: Toolbox, name: str, raw_input: dict[str, Any]) -> Tool
         "save_profile_fact": (SaveProfileFactArgs, toolbox.save_profile_fact),
         "get_current_datetime": (GetCurrentDatetimeArgs, toolbox.get_current_datetime),
     }
+    toolbox.last_retries = 0  # per-tool-call accounting; never stale in traces
     if name not in handlers:
         return ToolOutcome(ok=False, error=f"unknown tool {name!r}", error_type="unknown_tool")
     args_model, handler = handlers[name]

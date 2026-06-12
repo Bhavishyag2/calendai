@@ -186,9 +186,6 @@ def test_delete_requires_cross_turn_confirmation(harness, provider):
             # Turn 1: model tries to delete; gets confirmation_required; tells user.
             tool_call("delete_event", {"event_id": event.id}),
             text_response("This will delete 'Victim' at 10:30. Confirm?"),
-            # Turn 2: user said yes; model retries with the token.
-            tool_call("delete_event", {"event_id": event.id, "confirmation_token": "confirm-001"}),
-            text_response("Deleted."),
         ]
     )
 
@@ -196,9 +193,25 @@ def test_delete_requires_cross_turn_confirmation(harness, provider):
     assert "Confirm" in reply1
     assert provider.list_events(ALICE.email, at(0), at(23))  # still there
 
+    # The tool exchange is not persisted in history, so the model can only
+    # learn the token from turn 2's system prompt. The test extracts it from
+    # the gate the same way the loop does - nothing hardcoded.
+    pending = loop.toolbox.gate.pending()
+    assert len(pending) == 1
+    token = next(iter(pending))
+
+    client.queue(
+        tool_call("delete_event", {"event_id": event.id, "confirmation_token": token}),
+        text_response("Deleted."),
+    )
     reply2 = loop.run_turn("yes, go ahead")
     assert reply2 == "Deleted."
     assert provider.list_events(ALICE.email, at(0), at(23)) == []
+
+    # turn 2's system prompt carried everything the model needed to recover:
+    turn2_system = client.calls[2]["system"]
+    assert token in turn2_system
+    assert event.id in turn2_system
 
 
 def test_model_cannot_self_confirm_within_one_turn(harness, provider):
@@ -214,3 +227,73 @@ def test_model_cannot_self_confirm_within_one_turn(harness, provider):
     loop.run_turn("delete it")
     # the second call was rejected: token from the same turn is invalid
     assert provider.list_events(ALICE.email, at(0), at(23)), "event must survive self-confirm"
+
+
+def test_decline_revokes_confirmation_even_with_correct_token(harness, provider):
+    event = provider.create_event(ALICE.email, EventDraft(title="Keeper", start=at(5), end=at(6)))
+    loop, client = harness(
+        [
+            tool_call("delete_event", {"event_id": event.id}),
+            text_response("Delete 'Keeper' at 10:30. Confirm?"),
+        ]
+    )
+    loop.run_turn("delete keeper")
+    token = next(iter(loop.toolbox.gate.pending()))
+
+    # Adversarial model: the user says NO, but the model replays the real token.
+    client.queue(
+        tool_call("delete_event", {"event_id": event.id, "confirmation_token": token}),
+        text_response("Understood, I won't delete it."),
+    )
+    loop.run_turn("no, keep it")
+    assert provider.list_events(ALICE.email, at(0), at(23)), "decline must keep the event"
+    assert "cancelled" in client.calls[2]["system"]
+
+
+def test_unrelated_reply_does_not_authorize_pending_delete(harness, provider):
+    event = provider.create_event(
+        ALICE.email, EventDraft(title="Bystander", start=at(5), end=at(6))
+    )
+    loop, client = harness(
+        [
+            tool_call("delete_event", {"event_id": event.id}),
+            text_response("Delete 'Bystander'? Confirm?"),
+        ]
+    )
+    loop.run_turn("delete bystander")
+    token = next(iter(loop.toolbox.gate.pending()))
+
+    client.queue(
+        tool_call("delete_event", {"event_id": event.id, "confirmation_token": token}),
+        text_response("Here's your schedule."),
+    )
+    loop.run_turn("what's on my calendar today?")
+    assert provider.list_events(ALICE.email, at(0), at(23)), "unrelated reply must not consent"
+
+
+# -- crash hygiene ---------------------------------------------------------------
+
+
+def test_llm_exception_leaves_history_clean(harness, store):
+    loop, client = harness([RuntimeError("api down")])
+    with pytest.raises(RuntimeError, match="api down"):
+        loop.run_turn("hello?")
+    roles = [m["role"] for m in store.recent_messages(ALICE.id, limit=10)]
+    assert roles == ["user"], "no phantom assistant message after a crash"
+
+    # and the loop recovers cleanly on the next turn
+    client.queue(text_response("recovered"))
+    assert loop.run_turn("you there?") == "recovered"
+    roles = [m["role"] for m in store.recent_messages(ALICE.id, limit=10)]
+    assert roles == ["user", "user", "assistant"]
+
+
+def test_loop_guard_bail_discloses_partial_changes(harness, provider):
+    loop, client = harness(
+        [tool_call("create_event", {"title": "Halfway", "start": iso(5), "end": iso(6)})]
+    )
+    client.repeat_forever(tool_call("get_current_datetime", {}))
+    reply = loop.run_turn("create it and then loop forever")
+    assert reply != BAIL_MESSAGE  # plain bail would falsely claim "nothing changed"
+    assert "Halfway" in reply
+    assert len(provider.list_events(ALICE.email, at(0), at(23))) == 1

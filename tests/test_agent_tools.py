@@ -11,6 +11,7 @@ from calendai.agent.tools import (
     SaveProfileFactArgs,
     Toolbox,
     find_free_slots,
+    user_confirms,
 )
 from calendai.core.models import Attendee, EventDraft, FactType, TimeSlot, User
 from tests.conftest import at
@@ -128,27 +129,73 @@ def test_save_profile_fact_supersedes(toolbox, store):
 
 def test_gate_token_invalid_same_turn():
     gate = ConfirmationGate()
-    gate.new_turn()
-    token = gate.request("delete_event", "fp1")
+    gate.new_turn("delete the standup")
+    token = gate.request("delete_event", "fp1", "{}")
     assert gate.validate(token, "delete_event", "fp1") is False  # same turn
 
 
-def test_gate_token_valid_next_turn_once():
+def test_gate_token_valid_after_explicit_yes_once():
     gate = ConfirmationGate()
-    gate.new_turn()
-    token = gate.request("delete_event", "fp1")
-    gate.new_turn()
+    gate.new_turn("delete the standup")
+    token = gate.request("delete_event", "fp1", "{}")
+    gate.new_turn("yes, go ahead")
     assert gate.validate(token, "delete_event", "fp1") is True
     assert gate.validate(token, "delete_event", "fp1") is False  # single-use
 
 
 def test_gate_token_bound_to_action_and_args():
     gate = ConfirmationGate()
-    gate.new_turn()
-    token = gate.request("delete_event", "fp1")
-    gate.new_turn()
+    gate.new_turn("delete the standup")
+    token = gate.request("delete_event", "fp1", "{}")
+    gate.new_turn("yes")
     assert gate.validate(token, "update_event", "fp1") is False
     assert gate.validate(token, "delete_event", "fp-other") is False
+
+
+def test_gate_revoked_when_user_declines():
+    gate = ConfirmationGate()
+    gate.new_turn("delete it")
+    token = gate.request("delete_event", "fp1", "{}")
+    gate.new_turn("no, keep it")
+    assert gate.validate(token, "delete_event", "fp1") is False
+    assert "cancelled" in gate.prompt_context()
+
+
+def test_gate_revoked_on_unrelated_reply():
+    gate = ConfirmationGate()
+    gate.new_turn("delete it")
+    token = gate.request("delete_event", "fp1", "{}")
+    gate.new_turn("what's on my calendar tomorrow?")
+    assert gate.validate(token, "delete_event", "fp1") is False
+
+
+def test_gate_armed_token_expires_after_one_turn():
+    gate = ConfirmationGate()
+    gate.new_turn("delete it")
+    token = gate.request("delete_event", "fp1", "{}")
+    gate.new_turn("yes")  # armed but never used
+    gate.new_turn("yes")  # a turn later it is gone
+    assert gate.validate(token, "delete_event", "fp1") is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("yes", True),
+        ("Yes, go ahead", True),
+        ("sure, do it", True),
+        ("ok", True),
+        ("yes, cancel it", True),  # confirming a deletion phrased as "cancel"
+        ("no", False),
+        ("no, wait", False),
+        ("don't!", False),
+        ("yes... actually no, hold on", False),  # decline overrides confirm
+        ("what time is my standup?", False),  # unrelated
+        ("", False),
+    ],
+)
+def test_user_confirms(text, expected):
+    assert user_confirms(text) is expected
 
 
 # -- rule checker hook ----------------------------------------------------------------
