@@ -41,7 +41,14 @@ use - follow it precisely. If it says the confirmation was cancelled, do \
 not retry the action. Never invent, guess, or reuse confirmation tokens.
 - When the user states a lasting preference, rule, or tells you who someone \
 is ("Alex is alex@..."), persist it with save_profile_fact so future \
-sessions remember it.
+sessions remember it. USE THE CANONICAL KEYS - rules saved under these keys \
+are enforced in code; any other key is remembered but not enforced:
+  - rule:no_meetings_before, value {{"time": "HH:MM", "timezone": "<IANA>"}}
+  - rule:no_meetings_after, value {{"time": "HH:MM", "timezone": "<IANA>"}}
+  - rule:no_meetings_on, value {{"days": ["saturday", ...]}}
+  - rule:max_meeting_minutes, value {{"minutes": <int>}}
+  - contact:<lowercase first name>, value {{"email": "..."}}
+  - pref:<short_snake_case>, value: any JSON object
 - If a request is ambiguous (which event? which Alex? how long?), ask one \
 concise clarifying question instead of guessing.
 - Every tool call accepts a "rationale" field: fill it with one short \

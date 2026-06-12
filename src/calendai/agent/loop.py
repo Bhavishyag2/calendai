@@ -21,6 +21,7 @@ from calendai.agent.tools import Toolbox, anthropic_tool_schemas, execute_tool
 from calendai.core.clock import Clock
 from calendai.core.models import SpanKind, ToolOutcome, User
 from calendai.db.store import Store
+from calendai.memory.profile import profile_facts
 from calendai.traces.emitter import SQLiteTraceEmitter, new_request_id
 
 MAX_ITERATIONS = 12
@@ -43,6 +44,7 @@ class AgentLoop:
         tracer: SQLiteTraceEmitter,
         clock: Clock,
         user: User,
+        extractor: Any = None,  # EpisodicExtractor; optional so tests can omit it
     ) -> None:
         self.client = client
         self.model = model
@@ -51,6 +53,7 @@ class AgentLoop:
         self.tracer = tracer
         self.clock = clock
         self.user = user
+        self.extractor = extractor
         self.last_request_id: str | None = None
 
     # -- public API --------------------------------------------------------
@@ -73,7 +76,7 @@ class AgentLoop:
         system = build_system_prompt(
             self.user,
             self.clock,
-            self.store.list_facts(self.user.id),
+            profile_facts(self.store, self.user.id),
             confirmation_context=self.toolbox.gate.prompt_context(),
         )
         tools = anthropic_tool_schemas()
@@ -95,11 +98,23 @@ class AgentLoop:
                 with self.tracer.span(request_id, SpanKind.DECISION, "loop_guard") as span:
                     span.rationale = f"hit MAX_ITERATIONS={MAX_ITERATIONS}; bailing gracefully"
                 final_text = self._bail_message()
+            self._extract_memory(request_id, user_text, final_text)
             return final_text
         finally:
             if final_text is not None:
                 self.store.add_message(self.user.id, "assistant", final_text)
             self.tracer.end_request(request_id)
+
+    def _extract_memory(self, request_id: str, user_text: str, final_text: str) -> None:
+        """Post-turn episodic extraction; best-effort, runs only on completed turns."""
+        if self.extractor is None:
+            return
+        with self.tracer.span(request_id, SpanKind.MEMORY_OP, "episodic_extraction") as span:
+            saved = self.extractor.extract(self.user, user_text, final_text)
+            span.payload = {
+                "extracted_keys": [f.key for f in saved],
+                "error": getattr(self.extractor, "last_error", None),
+            }
 
     def _bail_message(self) -> str:
         """Loop-guard bail text; honest about mutations already applied."""

@@ -26,6 +26,8 @@ from calendai.core.clock import SystemClock
 from calendai.core.config import get_settings
 from calendai.core.models import User
 from calendai.db.store import Store
+from calendai.memory.enforcement import RuleEngine
+from calendai.memory.episodic import EpisodicExtractor
 from calendai.providers.fake import FakeCalendarProvider
 from calendai.traces.emitter import SQLiteTraceEmitter
 
@@ -50,9 +52,13 @@ def build_loop(user_email: str, provider_name: str, db_path: str | None = None) 
     else:  # pragma: no cover - google path lands with Batch 4
         raise SystemExit("provider 'google' arrives with the Google track merge (Batch 4)")
 
-    toolbox = Toolbox(provider=provider, store=store, user=user, clock=clock)
+    rule_engine = RuleEngine(store, user)
+    toolbox = Toolbox(
+        provider=provider, store=store, user=user, clock=clock, rule_checker=rule_engine.check
+    )
     tracer = SQLiteTraceEmitter(store, clock=clock)
     client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+    extractor = EpisodicExtractor(client, settings.calendai_utility_model, store, clock)
     return AgentLoop(
         client=client,
         model=settings.calendai_agent_model,
@@ -61,6 +67,7 @@ def build_loop(user_email: str, provider_name: str, db_path: str | None = None) 
         tracer=tracer,
         clock=clock,
         user=user,
+        extractor=extractor,
     )
 
 

@@ -91,7 +91,13 @@ class ResolveContactArgs(BaseModel):
 
 class SaveProfileFactArgs(BaseModel):
     fact_type: Literal["rule", "contact", "preference"]
-    key: str = Field(description="stable identity, e.g. rule:no_meetings_before, contact:alex")
+    key: str = Field(
+        description=(
+            "stable identity; USE CANONICAL KEYS where one fits, they are enforced in "
+            "code: rule:no_meetings_before, rule:no_meetings_after, rule:no_meetings_on, "
+            "rule:max_meeting_minutes, contact:<lowercase name>, pref:<snake_case>"
+        )
+    )
     value: dict[str, Any]
     statement: str = Field(description="one human-readable sentence stating the fact")
 
