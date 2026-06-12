@@ -219,6 +219,15 @@ def test_gate_armed_token_expires_after_one_turn():
         ("you want me to say yes", False),  # same, without the question mark
         ("I'll say yes once you double-check the time", False),
         ("my colleague said yes to the offsite", False),
+        # conditional or modified consent is not consent to the EXACT pending args:
+        ("yes but move it to five", False),
+        ("yes if no conflicts", False),
+        ("yes after you check availability", False),
+        ("yes once Bob confirms", False),
+        ("yeah maybe", False),
+        ("yes, change the time to 6 instead", False),  # modification, no hedge word
+        ("yes, delete the other one", False),  # points at different args
+        ("yes I'm sure", True),  # plain emphasis is still consent
         # consent must be short - long replies are new instructions:
         ("yes but first move my standup to five and invite bob and the team", False),
     ],

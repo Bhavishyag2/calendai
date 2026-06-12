@@ -125,6 +125,65 @@ _CONSENT_START_RE = re.compile(
     r"|definitely|go ahead|do it|proceed|approved?|sounds good"
     r"|please (?:do|proceed|go ahead)|i confirm|i agree)\b"
 )
+# ... and the WHOLE reply must be made of consent vocabulary. Any word outside
+# this set ("but", "if", "once", "move", "five", a person, a time) means the
+# user attached a condition or modification, which is not consent to execute
+# the exact pending arguments. The action echoes (delete/remove/cancel/update,
+# it/that/the event) allow "yes, delete it" without admitting free-form tails
+# like "yes, delete the other one".
+_CONSENT_VOCAB = frozenset(
+    [
+        # affirmatives
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "sure",
+        "ok",
+        "okay",
+        "confirm",
+        "confirmed",
+        "affirmative",
+        "absolutely",
+        "definitely",
+        "certainly",
+        "approved",
+        "agree",
+        "agreed",
+        "fine",
+        "good",
+        "great",
+        "perfect",
+        "right",
+        "correct",
+        "exactly",
+        # polite fillers / emphasis
+        "please",
+        "thanks",
+        "thank",
+        "you",
+        "i",
+        "im",
+        "am",
+        "sounds",
+        "that",
+        "its",
+        # imperative consent
+        "do",
+        "it",
+        "go",
+        "ahead",
+        "proceed",
+        # action echoes: "yes, delete it" - without free-form tails
+        "delete",
+        "remove",
+        "cancel",
+        "update",
+        "event",
+        "meeting",
+        "the",
+    ]
+)
 _MAX_CONSENT_WORDS = 10  # real confirmations are short; long replies are new asks
 
 
@@ -138,17 +197,22 @@ def user_confirms(text: str) -> bool:
     - any decline word vetoes ("yes... actually no");
     - the reply must START with a clear affirmative ("you want me to say
       yes" does not arm anything);
+    - every word must come from the consent vocabulary, so conditions and
+      modifications ("yes but move it to five", "yes if no conflicts",
+      "yeah maybe") never arm the pending action;
     - overlong replies don't count as consent - they are new instructions.
     """
     if "?" in text:
         return False
     if _DECLINE_RE.search(text):
         return False
-    normalized = re.sub(r"[^a-z0-9' ]+", " ", text.lower())
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    if not normalized or len(normalized.split()) > _MAX_CONSENT_WORDS:
+    normalized = re.sub(r"[^a-z0-9 ]+", " ", text.lower().replace("'", ""))
+    words = normalized.split()
+    if not words or len(words) > _MAX_CONSENT_WORDS:
         return False
-    return _CONSENT_START_RE.match(normalized) is not None
+    if not _CONSENT_START_RE.match(" ".join(words)):
+        return False
+    return all(word in _CONSENT_VOCAB for word in words)
 
 
 class ConfirmationGate:
