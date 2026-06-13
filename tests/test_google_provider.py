@@ -314,6 +314,54 @@ def test_naive_datetime_with_explicit_timezone_is_legal():
 
 
 @respx.mock
+def test_offset_wins_over_conflicting_timezone():
+    # an explicit offset takes precedence over a conflicting timeZone field;
+    # Event stores the resulting UTC instant. Locks this decision.
+    item = dict(EVENT_ITEM)
+    item["start"] = {"dateTime": "2026-06-15T10:00:00+00:00", "timeZone": "Asia/Kolkata"}
+    item["end"] = {"dateTime": "2026-06-15T10:30:00+00:00", "timeZone": "Asia/Kolkata"}
+    respx.get(EVENTS_URL).mock(return_value=httpx.Response(200, json={"items": [item]}))
+    provider, _ = make_provider()
+
+    (event,) = provider.list_events("primary", at(0), at(23))
+    assert event.start == datetime(2026, 6, 15, 10, 0, tzinfo=UTC)  # offset, not IST
+
+
+@respx.mock
+@pytest.mark.parametrize("items", [None, 42, "nope", {"k": "v"}])
+def test_items_not_a_list_is_malformed(items):
+    respx.get(EVENTS_URL).mock(return_value=httpx.Response(200, json={"items": items}))
+    provider, _ = make_provider()
+
+    with pytest.raises(MalformedResponseError):
+        provider.list_events("primary", at(0), at(23))
+
+
+@respx.mock
+def test_403_unhashable_reason_degrades_to_auth_error():
+    # {"reason": []} is unhashable; must not crash building the reason set
+    body = {"error": {"errors": [{"reason": []}, {"reason": 5}]}}
+    respx.get(EVENTS_URL).mock(return_value=httpx.Response(403, json=body))
+    provider, _ = make_provider()
+
+    with pytest.raises(AuthError):
+        provider.list_events("primary", at(0), at(23))
+
+
+@respx.mock
+def test_transport_failure_does_not_chain_original_exception():
+    respx.get(EVENTS_URL).mock(side_effect=httpx.ConnectError("down"))
+    provider, _ = make_provider()
+
+    with pytest.raises(ServerError) as excinfo:
+        provider.list_events("primary", at(0), at(23))
+    # `from None`: the httpx exception (whose .request carries the bearer
+    # header) is not chained into the traceback
+    assert excinfo.value.__cause__ is None
+    assert "token-1" not in str(excinfo.value)
+
+
+@respx.mock
 def test_naive_datetime_without_timezone_is_malformed():
     item = dict(EVENT_ITEM)
     item["start"] = {"dateTime": "2026-06-15T15:30:00"}

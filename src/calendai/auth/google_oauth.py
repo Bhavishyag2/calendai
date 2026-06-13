@@ -63,8 +63,9 @@ def _post_token(form: dict[str, str], clock: Clock) -> dict[str, Any]:
         response = httpx.post(TOKEN_ENDPOINT, data=form)
     except httpx.HTTPError as exc:
         # stays inside the provider error taxonomy (retryable ServerError);
-        # class name only - the form carries client_secret/refresh_token
-        raise ServerError(f"token endpoint transport failure: {exc.__class__.__name__}") from exc
+        # class name only AND `from None` - the form carries client_secret/
+        # refresh_token, and exc.request would echo it into any traceback
+        raise ServerError(f"token endpoint transport failure: {exc.__class__.__name__}") from None
     if response.status_code != 200:
         raise AuthError(f"token endpoint returned HTTP {response.status_code}")
     try:
@@ -122,12 +123,14 @@ def fetch_user_email(access_token: str) -> str:
     try:
         response = httpx.get(USERINFO_ENDPOINT, headers={"Authorization": f"Bearer {access_token}"})
     except httpx.HTTPError as exc:
-        raise ServerError(f"userinfo transport failure: {exc.__class__.__name__}") from exc
+        # `from None`: exc.request carries the bearer header
+        raise ServerError(f"userinfo transport failure: {exc.__class__.__name__}") from None
     if response.status_code != 200:
         raise AuthError(f"userinfo endpoint returned HTTP {response.status_code}")
     try:
+        # TypeError covers a JSON list/null/scalar body (not subscriptable)
         email = response.json()["email"]
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise MalformedResponseError("userinfo response is missing email") from exc
     if not isinstance(email, str) or not email:
         raise MalformedResponseError("userinfo email is not a non-empty string")

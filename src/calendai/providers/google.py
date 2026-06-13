@@ -32,6 +32,15 @@ Error mapping:
 Known limitation (user-visible): all-day events carry date-only start/end,
 which the aware-datetime Event model cannot represent; list_events SKIPS
 them. The list_events tool description discloses this to the agent.
+
+Retry idempotency policy (explicit): the Toolbox retries retryable errors
+(429/5xx/transport). DELETE is idempotent (a re-delete -> 404/410 ->
+NotFoundError, surfaced) and PATCH carries absolute field values (re-applying
+is a no-op), so both are retry-safe. CREATE (POST) is NOT idempotent: a retry
+after an AMBIGUOUS failure (5xx/transport where the write may have landed)
+could duplicate an event. For this take-home that residual risk is accepted
+and documented rather than solved; the production fix is a client-supplied
+idempotency key (Google supports a caller-set event id on insert).
 """
 
 from __future__ import annotations
@@ -201,7 +210,10 @@ class GoogleCalendarProvider(CalendarProvider):
             if page_token:
                 page_params["pageToken"] = page_token
             data = self._json(self._request("GET", url, params=page_params))
-            for item in data.get("items", []):
+            items = data.get("items", [])
+            if not isinstance(items, list):
+                raise MalformedResponseError("events 'items' is not a list")
+            for item in items:
                 event = self._event_from_item(item, calendar_id)
                 if event is not None:  # all-day events are skipped
                     events.append(event)
@@ -300,8 +312,10 @@ class GoogleCalendarProvider(CalendarProvider):
                 headers={"Authorization": f"Bearer {token}"},
             )
         except httpx.HTTPError as exc:
-            # Class name only: exception text must never echo the token.
-            raise ServerError(f"transport failure: {exc.__class__.__name__}") from exc
+            # Class name only AND `from None`: never echo the token, and never
+            # chain the original httpx exception (its .request carries the
+            # bearer header / form data into any traceback).
+            raise ServerError(f"transport failure: {exc.__class__.__name__}") from None
 
     def _raise_for_status(self, response: httpx.Response) -> None:
         status = response.status_code
@@ -329,7 +343,11 @@ class GoogleCalendarProvider(CalendarProvider):
         errors = error.get("errors") if isinstance(error, dict) else None
         if not isinstance(errors, list):
             errors = []
-        reasons = {e.get("reason") for e in errors if isinstance(e, dict)}
+        # only str reasons: a malformed {"reason": []} is unhashable and would
+        # otherwise raise TypeError when added to the set
+        reasons = {
+            e["reason"] for e in errors if isinstance(e, dict) and isinstance(e.get("reason"), str)
+        }
         if reasons & _RATE_LIMIT_REASONS:
             return RateLimitError("quota exceeded", retry_after=_parse_retry_after(response))
         return AuthError("permission denied (HTTP 403)")

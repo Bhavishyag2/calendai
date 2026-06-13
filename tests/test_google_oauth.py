@@ -171,6 +171,15 @@ def test_fetch_user_email_missing_field_raises_malformed():
         fetch_user_email("at-1")
 
 
+@respx.mock
+@pytest.mark.parametrize("body", [["a", "b"], None, 42, "string"])
+def test_fetch_user_email_non_object_body_is_malformed(body):
+    # a JSON list/null/scalar must not escape as a raw TypeError
+    respx.get(USERINFO_ENDPOINT).mock(return_value=httpx.Response(200, json=body))
+    with pytest.raises(MalformedResponseError):
+        fetch_user_email("at-1")
+
+
 # -- GoogleTokenManager -------------------------------------------------------
 
 
@@ -270,3 +279,6 @@ def test_token_endpoint_transport_failure_maps_to_server_error(settings, clock):
     assert excinfo.value.retryable is True
     assert "ConnectTimeout" in str(excinfo.value)
     assert "rt-1" not in str(excinfo.value)
+    # `from None`: the original httpx exception (whose .request carries the
+    # secret-bearing form) must not be chained into any traceback
+    assert excinfo.value.__cause__ is None
