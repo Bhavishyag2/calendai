@@ -14,11 +14,13 @@ from __future__ import annotations
 
 import secrets
 import threading
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.concurrency import run_in_threadpool
 
 from calendai.auth.google_oauth import build_auth_url, exchange_code, fetch_user_email
@@ -35,6 +37,22 @@ from calendai.web import runtime
 SESSION_COOKIE = "calendai_session"
 STATE_COOKIE = "calendai_oauth_state"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+SESSION_TTL = timedelta(days=7)
+MAX_MESSAGE_CHARS = 4000
+
+# Defense in depth for the inline SPA. 'unsafe-inline' is a deliberate, noted
+# weakening because the single-file SPA carries inline <script>/<style>; a build
+# step that externalizes them would let this tighten to nonces.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+        "img-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'"
+    ),
+}
 
 
 class AppState:
@@ -71,6 +89,23 @@ def _current_user(request: Request) -> User:
     return user
 
 
+def _require_same_origin(request: Request) -> None:
+    """CSRF defense for state-changing requests: when an Origin (or Referer)
+    header is present it MUST match this app's own origin. Browsers always send
+    Origin on cross-site fetch/XHR, so a forged request from another site is
+    rejected here regardless of SameSite behaviour."""
+    origin = request.headers.get("origin") or request.headers.get("referer")
+    if origin is None:
+        return  # same-origin form posts may omit it; cookies+SameSite still apply
+    parts = urlsplit(origin)
+    if (parts.scheme, parts.hostname, parts.port) != (
+        request.url.scheme,
+        request.url.hostname,
+        request.url.port,
+    ):
+        raise HTTPException(status_code=403, detail="cross-origin request rejected")
+
+
 def _set_session_cookie(response: Response, ctx: AppState, token: str) -> None:
     response.set_cookie(
         SESSION_COOKIE,
@@ -78,7 +113,8 @@ def _set_session_cookie(response: Response, ctx: AppState, token: str) -> None:
         httponly=True,
         samesite="lax",
         secure=ctx.secure_cookies,
-        max_age=7 * 24 * 3600,
+        path="/",
+        max_age=int(SESSION_TTL.total_seconds()),
     )
 
 
@@ -108,6 +144,14 @@ def create_app(
         shared_fake=shared_fake,
         secure_cookies=secure_cookies,
     )
+
+    @app.middleware("http")
+    async def _security_headers(request: Request, call_next):  # noqa: ANN202
+        response = await call_next(request)
+        for header, value in _SECURITY_HEADERS.items():
+            response.headers.setdefault(header, value)
+        return response
+
     _register_routes(app)
     return app
 
@@ -161,9 +205,10 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - cohesive route table
     def dev_login(request: Request, payload: dict[str, str]) -> JSONResponse:
         if not runtime.dev_login_enabled():
             raise HTTPException(status_code=404, detail="dev login disabled")
+        _require_same_origin(request)
         ctx = _state(request)
         email = (payload.get("email") or "").strip()
-        if "@" not in email:
+        if "@" not in email or len(email) > 254:
             raise HTTPException(status_code=400, detail="a valid email is required")
         user = _upsert_user(ctx, email)
         session_token = _new_session(ctx, user)
@@ -172,8 +217,11 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - cohesive route table
         return resp
 
     @app.post("/auth/logout")
-    def logout(response: Response) -> dict[str, bool]:
-        response.delete_cookie(SESSION_COOKIE)
+    def logout(request: Request, response: Response) -> dict[str, bool]:
+        token = request.cookies.get(SESSION_COOKIE)
+        if token:
+            _state(request).store.delete_session(token)  # server-side invalidation
+        response.delete_cookie(SESSION_COOKIE, path="/")
         return {"ok": True}
 
     # -- chat ---------------------------------------------------------------
@@ -181,20 +229,14 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - cohesive route table
     @app.post("/api/chat")
     async def chat(request: Request, payload: dict[str, str]) -> JSONResponse:
         user = _current_user(request)
+        _require_same_origin(request)
         message = (payload.get("message") or "").strip()
         if not message:
             raise HTTPException(status_code=400, detail="message is required")
+        if len(message) > MAX_MESSAGE_CHARS:
+            raise HTTPException(status_code=413, detail="message too long")
         reply, request_id = await run_in_threadpool(_run_turn, _state(request), user, message)
         return JSONResponse({"reply": reply, "request_id": request_id})
-
-    @app.get("/api/chat/stream")
-    async def chat_stream(request: Request, message: str = "") -> StreamingResponse:
-        user = _current_user(request)
-        if not message.strip():
-            raise HTTPException(status_code=400, detail="message is required")
-        ctx = _state(request)
-        reply, request_id = await run_in_threadpool(_run_turn, ctx, user, message.strip())
-        return StreamingResponse(_sse_reply(reply, request_id), media_type="text/event-stream")
 
     # -- memory + traces ----------------------------------------------------
 
@@ -244,7 +286,7 @@ def _upsert_user(ctx: AppState, email: str) -> User:
 
 def _new_session(ctx: AppState, user: User) -> str:
     token = secrets.token_urlsafe(32)
-    ctx.store.create_session(token, user.id, expires_at=None)
+    ctx.store.create_session(token, user.id, expires_at=ctx.clock.now() + SESSION_TTL)
     return token
 
 
@@ -258,11 +300,3 @@ def _run_turn(ctx: AppState, user: User, message: str) -> tuple[str, str]:
         )
         reply = loop.run_turn(message)
         return reply, loop.last_request_id or ""
-
-
-def _sse_reply(reply: str, request_id: str):  # noqa: ANN202 - generator of SSE frames
-    # The hand-rolled loop returns a complete reply, so we stream it word by
-    # word for a live typing effect rather than faking intermediate reasoning.
-    for word in reply.split(" "):
-        yield f"data: {word} \n\n"
-    yield f"event: done\ndata: {request_id}\n\n"

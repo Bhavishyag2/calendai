@@ -518,15 +518,17 @@ class Toolbox:
 
     def resolve_contact(self, args: ResolveContactArgs) -> ToolOutcome:
         name = args.name.strip().lower()
+        # ONLY this user's own stored contacts. A global registered-users
+        # lookup was removed deliberately: in a multi-user deployment it would
+        # leak other tenants' email addresses through the agent.
         fact_key = f"contact:{name}"
         for fact in self.store.list_facts(self.user.id, FactType.CONTACT):
             if fact.key == fact_key:
                 return ToolOutcome(ok=True, data=fact.value)
-        for candidate in self.store.list_users():
-            if candidate.display_name.lower() == name or candidate.email.lower() == name:
-                return ToolOutcome(
-                    ok=True, data={"email": candidate.email, "name": candidate.display_name}
-                )
+        if name == self.user.display_name.lower() or name == self.user.email.lower():
+            return ToolOutcome(
+                ok=True, data={"email": self.user.email, "name": self.user.display_name}
+            )
         return ToolOutcome(
             ok=False,
             error=f"I don't know who {args.name!r} is. Ask the user for their email, then "

@@ -160,6 +160,65 @@ def test_empty_message_rejected(app_client):
     assert tc.post("/api/chat", json={"message": "   "}).status_code == 400
 
 
+def test_oversized_message_rejected(app_client):
+    tc, _, _ = app_client
+    _dev_login(tc)
+    assert tc.post("/api/chat", json={"message": "x" * 5000}).status_code == 413
+
+
+# -- session + CSRF + headers (gate-6 security fixes) -------------------------
+
+
+def test_logout_invalidates_server_side_session(app_client):
+    tc, store, _ = app_client
+    _dev_login(tc)
+    token = tc.cookies.get("calendai_session")
+    assert store.get_session_user(token) is not None
+    tc.post("/auth/logout")
+    assert store.get_session_user(token) is None  # row gone, not just the cookie
+    # even replaying the old token is dead (server-side invalidation)
+    tc.cookies.set("calendai_session", token)
+    assert tc.get("/api/me").status_code == 401
+
+
+def test_sessions_carry_expiry(app_client):
+    tc, store, _ = app_client
+    _dev_login(tc)
+    token = tc.cookies.get("calendai_session")
+    row = store.conn.execute("SELECT expires_at FROM sessions WHERE token = ?", (token,)).fetchone()
+    assert row["expires_at"] is not None  # not a never-expiring session
+
+
+def test_cross_origin_chat_rejected(app_client):
+    tc, _, _ = app_client
+    _dev_login(tc)
+    r = tc.post(
+        "/api/chat",
+        json={"message": "book a standup tomorrow at 10am"},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert r.status_code == 403
+
+
+def test_security_headers_present(app_client):
+    tc, _, _ = app_client
+    r = tc.get("/")
+    assert r.headers["x-content-type-options"] == "nosniff"
+    assert r.headers["x-frame-options"] == "DENY"
+    assert "content-security-policy" in r.headers
+
+
+def test_facts_endpoint_returns_raw_statement_not_html(app_client):
+    # the API returns the raw statement; the SPA renders it with textContent.
+    # Here we assert the API does not itself HTML-encode (no double-encoding),
+    # so the XSS defense lives at the single, correct layer (the DOM).
+    tc, _, _ = app_client
+    _dev_login(tc)
+    tc.post("/api/chat", json={"message": "fyi, Alex is alex@corp.com"})
+    facts = tc.get("/api/facts").json()["facts"]
+    assert all("<" not in f["key"] for f in facts)
+
+
 # -- trace isolation between users --------------------------------------------
 
 

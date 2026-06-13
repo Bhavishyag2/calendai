@@ -95,10 +95,17 @@ def test_resolve_contact_from_memory_fact(toolbox, store):
     assert resolved.ok and resolved.data["email"] == "alex@corp.com"
 
 
-def test_resolve_contact_from_registered_users(toolbox, store):
+def test_resolve_contact_does_not_leak_other_registered_users(toolbox, store):
+    # another registered tenant must NOT be resolvable by name (cross-tenant
+    # email leak); only the user's own stored contacts resolve
     store.upsert_user(User(id="u_bob", email=BOB, display_name="Bob"))
     resolved = toolbox.resolve_contact(ResolveContactArgs(name="bob"))
-    assert resolved.ok and resolved.data["email"] == BOB
+    assert not resolved.ok and resolved.error_type == "unknown_contact"
+
+
+def test_resolve_contact_resolves_self(toolbox):
+    resolved = toolbox.resolve_contact(ResolveContactArgs(name="alice"))
+    assert resolved.ok and resolved.data["email"] == ALICE.email
 
 
 def test_resolve_unknown_contact_asks_for_help(toolbox):

@@ -104,9 +104,15 @@ $("#devbtn")?.addEventListener("click", async ()=>{
 });
 
 async function refreshFacts(){
-  const {facts}=await api("/api/facts"); const el=$("#facts");
-  el.innerHTML = facts.length ? "" : '<div class="sys" style="color:var(--mut)">No facts yet.</div>';
-  facts.forEach(f=>{ const d=document.createElement("div"); d.className="fact"; d.innerHTML=`<div class="k">[${f.type}] ${f.key}</div>${f.statement}`; el.appendChild(d); });
+  const {facts}=await api("/api/facts"); const el=$("#facts"); el.textContent="";
+  if(!facts.length){ const e=document.createElement("div"); e.className="sys"; e.style.color="var(--mut)"; e.textContent="No facts yet."; el.appendChild(e); return; }
+  // textContent only: fact text is user/LLM-derived and must never be parsed as HTML
+  facts.forEach(f=>{
+    const d=document.createElement("div"); d.className="fact";
+    const k=document.createElement("div"); k.className="k"; k.textContent=`[${f.type}] ${f.key}`;
+    const s=document.createElement("div"); s.textContent=f.statement;
+    d.append(k,s); el.appendChild(d);
+  });
 }
 async function refreshTraces(){
   const {requests}=await api("/api/traces"); const el=$("#traces"); el.innerHTML="";

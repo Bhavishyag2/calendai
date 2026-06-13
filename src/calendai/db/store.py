@@ -207,6 +207,12 @@ class Store:
             return None
         return self.get_user(row["user_id"])
 
+    def delete_session(self, token: str) -> None:
+        """Server-side session invalidation (logout): the token is dead even
+        if the cookie survives."""
+        self._conn.execute("DELETE FROM sessions WHERE token = ?", (token,))
+        self._conn.commit()
+
     # -- messages -------------------------------------------------------
 
     def add_message(
