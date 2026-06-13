@@ -151,7 +151,31 @@ tighten to nonces. Trace spans contain calendar metadata (titles, attendees) and
 are owner-scoped but not redacted — acceptable as per-user audit data for a demo,
 noted for production.
 
-## 10. Process: an adversarial second reviewer on every batch
+## 10. Known limitations (deliberately deferred for a take-home)
+
+A final multi-agent review pass surfaced these; each is a real observation whose
+*fix* is production-scale work disproportionate to a take-home, so they are
+documented rather than built:
+
+- **Single process-wide lock.** One `threading.Lock` serializes all agent turns
+  so the shared SQLite connection stays safe. In a multi-tenant deployment one
+  user's slow turn blocks others. Production fix: a per-user lock plus SQLite WAL
+  (or Postgres) and a connection pool. Acceptable for a single-process demo.
+- **Shared merge-interval logic** appears in three places (fake provider, Google
+  provider, `find_free_slots`). It should live in one `core` helper; the
+  duplication is small and currently consistent.
+- **Loop assembly** (RuleEngine + Toolbox + tracer + extractor + AgentLoop) is
+  built in three call sites (`cli`, `web/runtime`, `evals/runner`) with minor
+  per-context differences; `web/runtime.build_loop` is the natural single home.
+
+Several genuine bugs the same review found *were* fixed: an unverified-email
+account-takeover path in the OAuth userinfo step, an `httpx.Client` leak per web
+request, a trace lookup that scanned a recency window instead of querying by
+owner, an eval substring scorer that checked any turn instead of the final reply,
+unbounded attendee lists, and a judge API error that crashed a run instead of
+failing one check.
+
+## 11. Process: an adversarial second reviewer on every batch
 
 **Decision.** Each batch passed a blocking review gate by a second model (Codex)
 before the next batch began; a gate could fail repeatedly until clean.

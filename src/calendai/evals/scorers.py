@@ -144,16 +144,18 @@ def score_trajectory(expected: Expectations, tools_called: list[str]) -> list[Ch
 
 
 def score_reply_substrings(expected: Expectations, final_replies: list[str]) -> list[CheckResult]:
-    blob = "\n".join(final_replies).lower()
+    # check the FINAL assistant reply only (per the field name) - not a blob of
+    # every turn, which would let an early turn satisfy a final-reply assertion.
+    last = final_replies[-1].lower() if final_replies else ""
     results: list[CheckResult] = []
     for needle in expected.final_reply_contains:
-        present = needle.lower() in blob
+        present = needle.lower() in last
         results.append(
             CheckResult(
                 layer="reply",
-                name=f"reply contains {needle!r}",
+                name=f"final reply contains {needle!r}",
                 passed=present,
-                detail="" if present else "not found in any assistant reply",
+                detail="" if present else "not found in the final assistant reply",
             )
         )
     return results
@@ -187,7 +189,20 @@ def score_judge(
                 )
             )
             continue
-        verdict, raw = _judge_once(client, model, rubric.criterion, reply)
+        try:
+            verdict, raw = _judge_once(client, model, rubric.criterion, reply)
+        except Exception as exc:
+            # a judge API failure is a JUDGE failure, not a harness crash:
+            # record it as a failed check instead of aborting the whole run
+            results.append(
+                CheckResult(
+                    layer="judge",
+                    name=rubric.criterion,
+                    passed=False,
+                    detail=f"judge call failed: {type(exc).__name__}: {exc}",
+                )
+            )
+            continue
         results.append(
             CheckResult(
                 layer="judge",

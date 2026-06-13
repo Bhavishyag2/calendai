@@ -129,11 +129,18 @@ def fetch_user_email(access_token: str) -> str:
         raise AuthError(f"userinfo endpoint returned HTTP {response.status_code}")
     try:
         # TypeError covers a JSON list/null/scalar body (not subscriptable)
-        email = response.json()["email"]
+        data = response.json()
+        email = data["email"]
+        verified = data.get("email_verified")
     except (ValueError, KeyError, TypeError) as exc:
         raise MalformedResponseError("userinfo response is missing email") from exc
     if not isinstance(email, str) or not email:
         raise MalformedResponseError("userinfo email is not a non-empty string")
+    # Account-takeover guard: Google can return an UNVERIFIED email for accounts
+    # created without email verification. Identity is keyed on email, so an
+    # unverified address must never be trusted to log a user in.
+    if verified not in (True, "true"):
+        raise AuthError(f"refusing to authenticate unverified email {email!r}")
     return email
 
 

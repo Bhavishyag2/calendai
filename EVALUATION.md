@@ -16,8 +16,10 @@ run end-to-end on both tiers:
 | `claude-haiku-4-5`  | **13/20 (65%)** | 30/40 (75%) | ~1/10 |
 
 Utility model (memory extraction + judge) is `claude-haiku-4-5` in both. The
-project currently runs **Haiku on both tiers** to minimise API cost; flip
-`CALENDAI_AGENT_MODEL` to Sonnet for the higher-accuracy configuration.
+committed **default** agent model (`config.py`) is `claude-sonnet-4-6` — the
+recommended production config; this project's local `.env` sets
+`CALENDAI_AGENT_MODEL=claude-haiku-4-5` on both tiers to minimise API cost
+during development. Either is one env var away.
 
 ### The important part: safety is model-independent
 

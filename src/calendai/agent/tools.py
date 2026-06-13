@@ -19,6 +19,7 @@ import hashlib
 import json
 import random
 import re
+import secrets
 import time
 from collections.abc import Callable
 from datetime import timedelta
@@ -56,12 +57,18 @@ class ListEventsArgs(BaseModel):
     end: UtcDatetime
 
 
+# Cap attendee lists: an LLM (or a prompt-injection payload in a stored fact)
+# could otherwise pass hundreds of addresses, amplifying into one freebusy /
+# invite API call per address.
+MAX_ATTENDEES = 50
+
+
 class CreateEventArgs(BaseModel):
     title: str
     start: UtcDatetime
     end: UtcDatetime
     description: str = ""
-    attendee_emails: list[str] = Field(default_factory=list)
+    attendee_emails: list[str] = Field(default_factory=list, max_length=MAX_ATTENDEES)
 
 
 class UpdateEventArgs(BaseModel):
@@ -70,7 +77,7 @@ class UpdateEventArgs(BaseModel):
     start: UtcDatetime | None = None
     end: UtcDatetime | None = None
     description: str | None = None
-    attendee_emails: list[str] | None = None
+    attendee_emails: list[str] | None = Field(default=None, max_length=MAX_ATTENDEES)
     confirmation_token: str | None = None
 
 
@@ -83,7 +90,7 @@ class CheckAvailabilityArgs(BaseModel):
     window_start: UtcDatetime
     window_end: UtcDatetime
     duration_minutes: int = Field(gt=0, le=480)
-    attendee_emails: list[str] = Field(default_factory=list)
+    attendee_emails: list[str] = Field(default_factory=list, max_length=MAX_ATTENDEES)
 
 
 class ResolveContactArgs(BaseModel):
@@ -246,7 +253,6 @@ class ConfirmationGate:
 
     def __init__(self) -> None:
         self.turn = 0
-        self._counter = 0
         self._pending: dict[str, dict[str, Any]] = {}  # issued this turn
         self._armed: dict[str, dict[str, Any]] = {}  # user-consented; this turn only
         self._context_lines: list[str] = []
@@ -278,8 +284,9 @@ class ConfirmationGate:
                 )
 
     def request(self, action: str, fingerprint: str, summary: str) -> str:
-        self._counter += 1
-        token = f"confirm-{self._counter:03d}"
+        # random, non-enumerable token (defense in depth on top of the
+        # consent + argument-fingerprint checks in validate)
+        token = f"confirm-{secrets.token_hex(8)}"
         self._pending[token] = {"action": action, "fp": fingerprint, "summary": summary}
         return token
 

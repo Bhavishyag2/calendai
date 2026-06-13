@@ -118,6 +118,13 @@ def test_score_reply_substrings():
     assert not miss[0].passed
 
 
+def test_score_reply_substrings_checks_final_reply_only():
+    # a needle present only in an EARLIER turn must NOT satisfy the check
+    expect = Expectations(final_reply_contains=["booked"])
+    res = scorers.score_reply_substrings(expect, ["Booked your standup.", "Anything else?"])
+    assert not res[0].passed  # "booked" was in turn 1, not the final reply
+
+
 # -- scorers: judge (scripted utility client) --------------------------------
 
 
@@ -145,6 +152,22 @@ def test_score_judge_no_reply_at_index():
         [JudgeRubric(criterion="x", target_turn=5)], ["only one"], client, "m"
     )
     assert not res[0].passed and "no reply" in res[0].detail
+
+
+class ExplodingJudge:
+    def __init__(self):
+        self.messages = self
+
+    def create(self, **kwargs):
+        raise RuntimeError("judge API down")
+
+
+def test_score_judge_api_error_is_a_failed_check_not_a_crash():
+    res = scorers.score_judge(
+        [JudgeRubric(criterion="confirms time")], ["Booked."], ExplodingJudge(), "m"
+    )
+    assert len(res) == 1 and not res[0].passed
+    assert "judge call failed" in res[0].detail  # recorded, not propagated
 
 
 # -- report rendering ---------------------------------------------------------

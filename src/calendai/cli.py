@@ -49,8 +49,11 @@ def build_loop(user_email: str, provider_name: str, db_path: str | None = None) 
 
     if provider_name == "fake":
         provider = FakeCalendarProvider(clock)
-    else:  # pragma: no cover - google path lands with Batch 4
-        raise SystemExit("provider 'google' arrives with the Google track merge (Batch 4)")
+    else:  # pragma: no cover - the REPL is fake-only by design
+        raise SystemExit(
+            "The developer REPL runs against the fake calendar only. For the real "
+            "Google Calendar (OAuth sign-in), use the web app: python -m calendai.web"
+        )
 
     rule_engine = RuleEngine(store, user)
     toolbox = Toolbox(

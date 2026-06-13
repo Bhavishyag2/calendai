@@ -138,6 +138,24 @@ class SQLiteTraceEmitter:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def recent_requests_for_user(self, user_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """A user's own recent requests, filtered in SQL (no cross-user scan)."""
+        rows = self._store.conn.execute(
+            "SELECT * FROM trace_requests WHERE user_id = ? "
+            "ORDER BY started_at DESC, rowid DESC LIMIT ?",
+            (user_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def request_for_user(self, request_id: str, user_id: str) -> dict[str, Any] | None:
+        """One request, looked up directly and scoped to its owner: no linear
+        scan, no existence oracle, and no recency cutoff hiding old requests."""
+        row = self._store.conn.execute(
+            "SELECT * FROM trace_requests WHERE request_id = ? AND user_id = ?",
+            (request_id, user_id),
+        ).fetchone()
+        return dict(row) if row else None
+
 
 class NullTraceEmitter:
     """No-op emitter for tests that don't care about tracing."""

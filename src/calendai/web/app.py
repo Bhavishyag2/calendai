@@ -184,11 +184,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - cohesive route table
         return resp
 
     @app.get("/auth/callback")
-    def callback(request: Request, code: str = "", state: str = "") -> RedirectResponse:
+    def callback(
+        request: Request, code: str = "", state: str = "", error: str = ""
+    ) -> RedirectResponse:
         ctx = _state(request)
         expected = request.cookies.get(STATE_COOKIE)
         if not expected or not state or not secrets.compare_digest(state, expected):
             raise HTTPException(status_code=400, detail="invalid OAuth state")
+        if error:  # Google sends ?error=access_denied when the user declines consent
+            raise HTTPException(
+                status_code=400, detail=f"Google sign-in was not completed: {error}"
+            )
         if not code:
             raise HTTPException(status_code=400, detail="missing authorization code")
         token_payload = exchange_code(ctx.settings, code, clock=ctx.clock)
@@ -253,8 +259,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - cohesive route table
     @app.get("/api/traces")
     def traces(request: Request, user: User = Depends(_current_user)) -> dict[str, list]:
         tracer = SQLiteTraceEmitter(_state(request).store, clock=_state(request).clock)
-        reqs = [r for r in tracer.recent_requests(limit=50) if r["user_id"] == user.id]
-        return {"requests": reqs}
+        return {"requests": tracer.recent_requests_for_user(user.id, limit=50)}
 
     @app.get("/api/traces/{request_id}")
     def trace_detail(
@@ -262,10 +267,8 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - cohesive route table
     ) -> dict:
         ctx = _state(request)
         tracer = SQLiteTraceEmitter(ctx.store, clock=ctx.clock)
-        owner = next(
-            (r for r in tracer.recent_requests(limit=500) if r["request_id"] == request_id), None
-        )
-        if owner is None or owner["user_id"] != user.id:
+        owner = tracer.request_for_user(request_id, user.id)  # direct, owner-scoped
+        if owner is None:
             raise HTTPException(status_code=404, detail="trace not found")
         return {"request": owner, "spans": tracer.spans_for(request_id)}
 
@@ -296,8 +299,17 @@ def _run_turn(ctx: AppState, user: User, message: str) -> tuple[str, str]:
         provider = runtime.build_provider(
             ctx.store, user, ctx.settings, ctx.cipher, ctx.clock, shared_fake=ctx.shared_fake
         )
-        loop = runtime.build_loop(
-            ctx.store, user, provider, ctx.settings, ctx.clock, ctx.agent_client
-        )
-        reply = loop.run_turn(message)
-        return reply, loop.last_request_id or ""
+        try:
+            loop = runtime.build_loop(
+                ctx.store, user, provider, ctx.settings, ctx.clock, ctx.agent_client
+            )
+            reply = loop.run_turn(message)
+            return reply, loop.last_request_id or ""
+        finally:
+            # a per-request GoogleCalendarProvider owns an httpx.Client; close it
+            # so we don't leak a connection pool every turn. The shared fake
+            # provider persists across requests and must NOT be closed.
+            if provider is not ctx.shared_fake:
+                close = getattr(provider, "close", None)
+                if callable(close):
+                    close()

@@ -158,7 +158,9 @@ def test_refresh_uses_new_refresh_token_when_present(settings, clock):
 @respx.mock
 def test_fetch_user_email():
     route = respx.get(USERINFO_ENDPOINT).mock(
-        return_value=httpx.Response(200, json={"email": "person@example.com", "sub": "123"})
+        return_value=httpx.Response(
+            200, json={"email": "person@example.com", "email_verified": True, "sub": "123"}
+        )
     )
     assert fetch_user_email("at-1") == "person@example.com"
     assert route.calls.last.request.headers["Authorization"] == "Bearer at-1"
@@ -168,6 +170,27 @@ def test_fetch_user_email():
 def test_fetch_user_email_missing_field_raises_malformed():
     respx.get(USERINFO_ENDPOINT).mock(return_value=httpx.Response(200, json={"sub": "123"}))
     with pytest.raises(MalformedResponseError):
+        fetch_user_email("at-1")
+
+
+@respx.mock
+def test_fetch_user_email_rejects_unverified():
+    # account-takeover guard: an unverified Google email must not authenticate
+    respx.get(USERINFO_ENDPOINT).mock(
+        return_value=httpx.Response(
+            200, json={"email": "victim@corp.com", "email_verified": False, "sub": "9"}
+        )
+    )
+    with pytest.raises(AuthError, match="unverified"):
+        fetch_user_email("at-1")
+
+
+@respx.mock
+def test_fetch_user_email_rejects_missing_verified_flag():
+    respx.get(USERINFO_ENDPOINT).mock(
+        return_value=httpx.Response(200, json={"email": "victim@corp.com", "sub": "9"})
+    )
+    with pytest.raises(AuthError, match="unverified"):
         fetch_user_email("at-1")
 
 

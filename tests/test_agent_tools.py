@@ -108,6 +108,36 @@ def test_resolve_contact_resolves_self(toolbox):
     assert resolved.ok and resolved.data["email"] == ALICE.email
 
 
+def test_attendee_list_is_capped(toolbox):
+    # resource-amplification guard: >50 attendees is rejected as invalid args
+    from calendai.agent.tools import execute_tool
+
+    many = [f"p{i}@x.com" for i in range(51)]
+    out = execute_tool(
+        toolbox,
+        "create_event",
+        {
+            "title": "Huge",
+            "start": at(5).isoformat(),
+            "end": at(6).isoformat(),
+            "attendee_emails": many,
+        },
+    )
+    assert not out.ok and out.error_type == "invalid_arguments"
+    # 50 is allowed
+    ok = execute_tool(
+        toolbox,
+        "create_event",
+        {
+            "title": "Fine",
+            "start": at(5).isoformat(),
+            "end": at(6).isoformat(),
+            "attendee_emails": many[:50],
+        },
+    )
+    assert ok.ok
+
+
 def test_resolve_unknown_contact_asks_for_help(toolbox):
     outcome = toolbox.resolve_contact(ResolveContactArgs(name="Zara"))
     assert not outcome.ok

@@ -244,6 +244,19 @@ def test_oauth_callback_rejects_bad_state(app_client):
     assert r.status_code == 400
 
 
+def test_oauth_callback_handles_user_denied_consent(app_client):
+    tc, _, _ = app_client
+    login = tc.get("/auth/login", follow_redirects=False)
+    state = parse_qs(urlsplit(login.headers["location"]).query)["state"][0]
+    # Google redirects with ?error=access_denied (and the valid state) on denial
+    r = tc.get(
+        "/auth/callback",
+        params={"error": "access_denied", "state": state},
+        follow_redirects=False,
+    )
+    assert r.status_code == 400 and "not completed" in r.json()["detail"]
+
+
 @respx.mock
 def test_oauth_callback_happy_path(app_client):
     tc, store, _ = app_client
@@ -253,7 +266,9 @@ def test_oauth_callback_happy_path(app_client):
         )
     )
     respx.get(USERINFO_ENDPOINT).mock(
-        return_value=httpx.Response(200, json={"email": "carol@example.com"})
+        return_value=httpx.Response(
+            200, json={"email": "carol@example.com", "email_verified": True}
+        )
     )
     # drive the real state handshake: login sets the state cookie
     login = tc.get("/auth/login", follow_redirects=False)
