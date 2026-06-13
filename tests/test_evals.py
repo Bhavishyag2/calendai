@@ -325,7 +325,7 @@ def test_packaged_scenarios_load_and_are_unique():
 
     scenario_dir = Path(__file__).resolve().parents[1] / "evals" / "scenarios"
     scenarios = load_scenarios(scenario_dir)
-    assert len(scenarios) >= 18  # the brief asks for a substantial suite
+    assert len(scenarios) >= 18  # a substantial scenario suite is expected
     for s in scenarios:
         assert s.users and s.sessions  # every scenario is runnable
 

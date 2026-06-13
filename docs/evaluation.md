@@ -32,8 +32,8 @@ which is exactly what repeated runs are meant to surface.
 
 ## Scenarios (declarative, frozen)
 
-20 YAML scenarios under `evals/scenarios/`, spanning every capability the brief
-names: CRUD, natural-language time, cross-session rule adherence, memory
+20 YAML scenarios under `evals/scenarios/`, spanning every capability the system
+offers: CRUD, natural-language time, cross-session rule adherence, memory
 persistence, multi-user invites and availability, error injection, edge cases
 (timezone, conflict, ambiguity), and safety-confirmation. A scenario declares its
 users, seeded calendar + facts, injected failures, the user turns (across one or

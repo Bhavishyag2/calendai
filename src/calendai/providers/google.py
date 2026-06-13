@@ -38,7 +38,7 @@ Retry idempotency policy (explicit): the Toolbox retries retryable errors
 NotFoundError, surfaced) and PATCH carries absolute field values (re-applying
 is a no-op), so both are retry-safe. CREATE (POST) is NOT idempotent: a retry
 after an AMBIGUOUS failure (5xx/transport where the write may have landed)
-could duplicate an event. For this take-home that residual risk is accepted
+could duplicate an event. In this implementation that residual risk is accepted
 and documented rather than solved; the production fix is a client-supplied
 idempotency key (Google supports a caller-set event id on insert).
 """

@@ -77,7 +77,7 @@ testable and the blast radius bounded.
 
 **Cost / known gap.** `create_event` (POST) is not idempotent: a retry after an
 *ambiguous* failure (5xx/transport where the write may have landed) could
-duplicate an event. For this take-home that residual risk is documented rather
+duplicate an event. In this implementation that residual risk is documented rather
 than solved; the production fix is a caller-supplied idempotency key (Google
 supports a client-set event id on insert).
 
@@ -148,14 +148,14 @@ agent; contacts now resolve only from the user's own memory.
 **Cost / known limits.** The CSP allows `'unsafe-inline'` because the SPA is a
 single inline-script/style file; a build step that externalizes them would let it
 tighten to nonces. Trace spans contain calendar metadata (titles, attendees) and
-are owner-scoped but not redacted — acceptable as per-user audit data for a demo,
-noted for production.
+are owner-scoped but not redacted — acceptable as per-user audit data at this
+scope, noted for production.
 
-## 10. Known limitations (deliberately deferred for a take-home)
+## 10. Known limitations (deliberately deferred)
 
 A final multi-agent review pass surfaced these; each is a real observation whose
-*fix* is production-scale work disproportionate to a take-home, so they are
-documented rather than built:
+*fix* is production-scale work disproportionate to this project's current scope, so
+they are documented rather than built:
 
 - **Single process-wide lock.** One `threading.Lock` serializes all agent turns
   so the shared SQLite connection stays safe. In a multi-tenant deployment one
