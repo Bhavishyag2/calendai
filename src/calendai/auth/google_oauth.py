@@ -24,7 +24,7 @@ import httpx
 from calendai.auth.tokens import TokenCipher
 from calendai.core.clock import Clock, SystemClock
 from calendai.core.config import Settings
-from calendai.core.provider import AuthError, MalformedResponseError
+from calendai.core.provider import AuthError, MalformedResponseError, ServerError
 from calendai.db.store import Store
 
 AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -59,7 +59,12 @@ def _post_token(form: dict[str, str], clock: Clock) -> dict[str, Any]:
     Returns {access_token, refresh_token, expires_at} where expires_at is
     an aware ISO-8601 string computed from expires_in via the clock.
     """
-    response = httpx.post(TOKEN_ENDPOINT, data=form)
+    try:
+        response = httpx.post(TOKEN_ENDPOINT, data=form)
+    except httpx.HTTPError as exc:
+        # stays inside the provider error taxonomy (retryable ServerError);
+        # class name only - the form carries client_secret/refresh_token
+        raise ServerError(f"token endpoint transport failure: {exc.__class__.__name__}") from exc
     if response.status_code != 200:
         raise AuthError(f"token endpoint returned HTTP {response.status_code}")
     try:
@@ -114,7 +119,10 @@ def refresh_access_token(
 
 def fetch_user_email(access_token: str) -> str:
     """Resolve the authenticated user's email via the OIDC userinfo endpoint."""
-    response = httpx.get(USERINFO_ENDPOINT, headers={"Authorization": f"Bearer {access_token}"})
+    try:
+        response = httpx.get(USERINFO_ENDPOINT, headers={"Authorization": f"Bearer {access_token}"})
+    except httpx.HTTPError as exc:
+        raise ServerError(f"userinfo transport failure: {exc.__class__.__name__}") from exc
     if response.status_code != 200:
         raise AuthError(f"userinfo endpoint returned HTTP {response.status_code}")
     try:

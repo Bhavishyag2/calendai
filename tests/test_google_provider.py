@@ -1,14 +1,13 @@
 """GoogleCalendarProvider tests, fully respx-mocked (no network, no sleeping).
 
-Covers the mapping layer (API items <-> frozen models), the hand-rolled
-retry/backoff layer (injectable sleep_fn records delays), the 401
+Covers the mapping layer (API items <-> frozen models), error-taxonomy
+mapping (single attempt - retries belong to the Toolbox), the 401
 refresh-once flow, and the all-or-nothing freebusy contract.
 """
 
 from __future__ import annotations
 
 import json
-import random
 from datetime import UTC, datetime
 
 import httpx
@@ -27,6 +26,7 @@ from calendai.core.provider import (
     MalformedResponseError,
     NotFoundError,
     ProviderError,
+    RateLimitError,
     ServerError,
 )
 from calendai.providers.google import BASE_URL, FREEBUSY_URL, GoogleCalendarProvider
@@ -75,15 +75,11 @@ class StubTokens:
         return self.current
 
 
-def make_provider(
-    sleeps: list[float] | None = None,
-) -> tuple[GoogleCalendarProvider, StubTokens]:
+def make_provider() -> tuple[GoogleCalendarProvider, StubTokens]:
     tokens = StubTokens()
     provider = GoogleCalendarProvider(
         token_provider=tokens.token_provider,
         refresh_fn=tokens.refresh,
-        sleep_fn=sleeps.append if sleeps is not None else lambda _s: None,
-        rng=random.Random(0),
     )
     return provider, tokens
 
@@ -236,57 +232,47 @@ def test_malformed_json_body_raises_malformed_response():
         provider.list_events("primary", at(0), at(23))
 
 
-# -- retry layer ----------------------------------------------------------
+# -- error mapping (retries are the Toolbox's job: exactly ONE attempt here) --
 
 
 @respx.mock
-def test_429_with_retry_after_is_retried_then_succeeds():
+def test_429_raises_rate_limit_with_retry_after_no_provider_retry():
     route = respx.get(EVENTS_URL).mock(
-        side_effect=[
-            httpx.Response(429, headers={"Retry-After": "2.5"}),
-            httpx.Response(200, json={"items": [EVENT_ITEM]}),
-        ]
+        return_value=httpx.Response(429, headers={"Retry-After": "2.5"})
     )
-    sleeps: list[float] = []
-    provider, _ = make_provider(sleeps=sleeps)
+    provider, _ = make_provider()
 
-    events = provider.list_events("primary", at(0), at(23))
-
-    assert [e.id for e in events] == ["evt1"]
-    assert route.call_count == 2
-    assert sleeps == [2.5]  # honored the Retry-After header verbatim
-
-
-@respx.mock
-def test_5xx_retried_to_exhaustion_raises_server_error():
-    route = respx.get(EVENTS_URL).mock(return_value=httpx.Response(503))
-    sleeps: list[float] = []
-    provider, _ = make_provider(sleeps=sleeps)
-
-    with pytest.raises(ServerError):
+    with pytest.raises(RateLimitError) as excinfo:
         provider.list_events("primary", at(0), at(23))
 
-    assert route.call_count == 3  # max attempts
-    assert len(sleeps) == 2  # no sleep after the final failure
-    assert 0.5 <= sleeps[0] <= 1.0  # base + jitter within [base, 2*base]
-    assert 1.0 <= sleeps[1] <= 2.0
+    assert excinfo.value.retry_after == 2.5  # toolbox honors this
+    assert excinfo.value.retryable is True
+    assert route.call_count == 1  # no provider-level retry (no 3x3 multiplication)
 
 
 @respx.mock
-def test_403_rate_limit_reason_maps_to_rate_limit_and_retries():
-    quota_body = {"error": {"errors": [{"reason": "rateLimitExceeded"}]}}
-    route = respx.get(EVENTS_URL).mock(
-        side_effect=[
-            httpx.Response(403, json=quota_body),
-            httpx.Response(200, json={"items": []}),
-        ]
-    )
-    sleeps: list[float] = []
-    provider, _ = make_provider(sleeps=sleeps)
+def test_5xx_raises_server_error_single_attempt():
+    route = respx.get(EVENTS_URL).mock(return_value=httpx.Response(503))
+    provider, _ = make_provider()
 
-    assert provider.list_events("primary", at(0), at(23)) == []
-    assert route.call_count == 2
-    assert sleeps == [1.0]  # default retry_after when no Retry-After header
+    with pytest.raises(ServerError) as excinfo:
+        provider.list_events("primary", at(0), at(23))
+
+    assert excinfo.value.retryable is True
+    assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.parametrize("reason", ["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"])
+def test_403_rate_limit_reasons_map_to_rate_limit(reason):
+    quota_body = {"error": {"errors": [{"reason": reason}]}}
+    route = respx.get(EVENTS_URL).mock(return_value=httpx.Response(403, json=quota_body))
+    provider, _ = make_provider()
+
+    with pytest.raises(RateLimitError) as excinfo:
+        provider.list_events("primary", at(0), at(23))
+    assert excinfo.value.retry_after == 1.0  # default when no Retry-After header
+    assert route.call_count == 1
 
 
 @respx.mock
@@ -298,6 +284,81 @@ def test_403_other_reason_raises_auth_error_without_retry():
     with pytest.raises(AuthError):
         provider.list_events("primary", at(0), at(23))
     assert route.call_count == 1
+
+
+@respx.mock
+@pytest.mark.parametrize("body", [[], {"error": []}, {"error": {"errors": "nope"}}, "junk"])
+def test_403_with_weird_error_body_degrades_to_auth_error(body):
+    respx.get(EVENTS_URL).mock(return_value=httpx.Response(403, json=body))
+    provider, _ = make_provider()
+
+    with pytest.raises(AuthError):
+        provider.list_events("primary", at(0), at(23))
+
+
+# -- shape robustness (gate-4 blockers) ---------------------------------------
+
+
+@respx.mock
+def test_naive_datetime_with_explicit_timezone_is_legal():
+    # Google may omit the offset when timeZone is explicitly specified
+    item = dict(EVENT_ITEM)
+    item["start"] = {"dateTime": "2026-06-15T15:30:00", "timeZone": "Asia/Kolkata"}
+    item["end"] = {"dateTime": "2026-06-15T16:00:00", "timeZone": "Asia/Kolkata"}
+    respx.get(EVENTS_URL).mock(return_value=httpx.Response(200, json={"items": [item]}))
+    provider, _ = make_provider()
+
+    (event,) = provider.list_events("primary", at(0), at(23))
+    assert event.start == datetime(2026, 6, 15, 10, 0, tzinfo=UTC)  # 15:30 IST
+    assert event.end == datetime(2026, 6, 15, 10, 30, tzinfo=UTC)
+
+
+@respx.mock
+def test_naive_datetime_without_timezone_is_malformed():
+    item = dict(EVENT_ITEM)
+    item["start"] = {"dateTime": "2026-06-15T15:30:00"}
+    respx.get(EVENTS_URL).mock(return_value=httpx.Response(200, json={"items": [item]}))
+    provider, _ = make_provider()
+
+    with pytest.raises(MalformedResponseError):
+        provider.list_events("primary", at(0), at(23))
+
+
+@respx.mock
+def test_unknown_timezone_name_is_malformed():
+    item = dict(EVENT_ITEM)
+    item["start"] = {"dateTime": "2026-06-15T15:30:00", "timeZone": "Mars/Olympus"}
+    item["end"] = {"dateTime": "2026-06-15T16:00:00", "timeZone": "Mars/Olympus"}
+    respx.get(EVENTS_URL).mock(return_value=httpx.Response(200, json={"items": [item]}))
+    provider, _ = make_provider()
+
+    with pytest.raises(MalformedResponseError):
+        provider.list_events("primary", at(0), at(23))
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "items",
+    [[None], ["junk"], [{"start": "nope", "end": {}}], [{"start": None, "end": None}]],
+)
+def test_shape_junk_in_items_is_malformed_not_a_crash(items):
+    respx.get(EVENTS_URL).mock(return_value=httpx.Response(200, json={"items": items}))
+    provider, _ = make_provider()
+
+    with pytest.raises(MalformedResponseError):
+        provider.list_events("primary", at(0), at(23))
+
+
+@respx.mock
+def test_get_event_cancelled_status_maps_to_not_found():
+    # events.get returns deleted events as status=cancelled, often id-only
+    respx.get(f"{EVENTS_URL}/evt1").mock(
+        return_value=httpx.Response(200, json={"id": "evt1", "status": "cancelled"})
+    )
+    provider, _ = make_provider()
+
+    with pytest.raises(NotFoundError):
+        provider.get_event("primary", "evt1")
 
 
 # -- 401 refresh flow -------------------------------------------------------
@@ -389,3 +450,29 @@ def test_freebusy_missing_calendar_in_response_raises_provider_error():
 
     with pytest.raises(ProviderError, match="all-or-nothing"):
         provider.freebusy(["primary", "dev@example.com"], at(0), at(23))
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"calendars": []},  # list where an object is expected
+        {"calendars": {"primary": "junk"}},  # entry is not an object
+    ],
+)
+def test_freebusy_shape_junk_raises_within_taxonomy(response):
+    respx.post(FREEBUSY_URL).mock(return_value=httpx.Response(200, json=response))
+    provider, _ = make_provider()
+
+    with pytest.raises(ProviderError):  # Malformed or all-or-nothing, never AttributeError
+        provider.freebusy(["primary"], at(0), at(23))
+
+
+@respx.mock
+def test_freebusy_non_list_busy_is_malformed():
+    response = {"calendars": {"primary": {"busy": {"start": "x"}}}}
+    respx.post(FREEBUSY_URL).mock(return_value=httpx.Response(200, json=response))
+    provider, _ = make_provider()
+
+    with pytest.raises(MalformedResponseError):
+        provider.freebusy(["primary"], at(0), at(23))

@@ -255,3 +255,18 @@ def test_manager_never_persists_plaintext_tokens(manager, store, cipher):
     decrypted = cipher.decrypt(blob)  # but the cipher path still round-trips
     assert decrypted["access_token"] == "at-2"
     assert decrypted["refresh_token"] == "rt-2"
+
+
+@respx.mock
+def test_token_endpoint_transport_failure_maps_to_server_error(settings, clock):
+    from calendai.core.provider import ServerError
+
+    respx.post(TOKEN_ENDPOINT).mock(side_effect=httpx.ConnectTimeout("boom"))
+
+    with pytest.raises(ServerError) as excinfo:
+        refresh_access_token(settings, "rt-1", clock)
+
+    # retryable, inside the taxonomy, and never echoes the secret-bearing form
+    assert excinfo.value.retryable is True
+    assert "ConnectTimeout" in str(excinfo.value)
+    assert "rt-1" not in str(excinfo.value)

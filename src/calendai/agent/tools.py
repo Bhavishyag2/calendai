@@ -573,7 +573,12 @@ class Toolbox:
 # -- registry / Anthropic schema ------------------------------------------
 
 _TOOL_DEFS: list[tuple[str, str, type[BaseModel]]] = [
-    ("list_events", "List the user's calendar events in a UTC window.", ListEventsArgs),
+    (
+        "list_events",
+        "List the user's calendar events in a UTC window. All-day events are "
+        "not modeled and will not appear.",
+        ListEventsArgs,
+    ),
     ("create_event", "Create a calendar event, optionally inviting attendees.", CreateEventArgs),
     (
         "update_event",

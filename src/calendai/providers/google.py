@@ -10,30 +10,37 @@ deliberately does NOT use google-api-python-client.
 - Retry behavior stays visible and under our control instead of being
   buried inside googleapiclient internals.
 
-The retry layer is hand-rolled rather than imported from tenacity for the
-same reason: it is ~30 lines, every backoff decision is explicit and
-assertable (sleep_fn is injectable so tests run instantly), and for a
-take-home, full control plus visibility beats taking on a dependency.
+Retry ownership: the TOOLBOX owns retries (backoff + jitter, honors
+retry_after) because it is provider-agnostic and is the layer evals
+exercise with failure injection. This provider performs each logical call
+exactly ONCE - its only second request is the single 401 token-refresh
+resend, which is auth recovery, not a retry. (An earlier revision retried
+here too; gate review flagged the 3x3 retry multiplication.)
 
 Error mapping:
-- 401: refresh the token once and retry the request; a second 401 raises
-  AuthError (re-authentication required).
-- 403: RateLimitError when the body reason is rateLimitExceeded or
-  userRateLimitExceeded, otherwise AuthError.
+- 401: refresh the token once and resend; a second 401 raises AuthError
+  (re-authentication required).
+- 403: RateLimitError when the body reason is rateLimitExceeded,
+  userRateLimitExceeded or quotaExceeded, otherwise AuthError.
 - 404 and 410: NotFoundError (Google returns 410 Gone for deleted events).
+  (Revisit 410 if syncToken/updatedMin sync is ever added - there it means
+  "full sync required".)
 - 429: RateLimitError carrying the Retry-After header (default 1.0s).
-- 5xx and transport failures: ServerError (retryable).
-- 200 with an unparseable body: MalformedResponseError.
+- 5xx and transport failures: ServerError (retryable by the toolbox).
+- 200 with an unparseable or shape-invalid body: MalformedResponseError.
+
+Known limitation (user-visible): all-day events carry date-only start/end,
+which the aware-datetime Event model cannot represent; list_events SKIPS
+them. The list_events tool description discloses this to the agent.
 """
 
 from __future__ import annotations
 
-import random
-import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import httpx
 
@@ -59,9 +66,9 @@ from calendai.core.provider import (
 BASE_URL = "https://www.googleapis.com/calendar/v3"
 FREEBUSY_URL = f"{BASE_URL}/freeBusy"
 
-_MAX_ATTEMPTS = 3
-_BACKOFF_BASE_SECONDS = 0.5
-_RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
+# quotaExceeded included: Google documents Calendar usage limits as
+# HTTP 403 reason=quotaExceeded (gate-4 review citation).
+_RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"})
 
 
 def _rfc3339(dt: datetime) -> str:
@@ -84,6 +91,18 @@ def _parse_retry_after(response: httpx.Response) -> float:
 
 def _parse_optional_dt(raw: str | None) -> datetime | None:
     return datetime.fromisoformat(raw) if raw else None
+
+
+def _parse_api_datetime(time_obj: dict[str, Any]) -> datetime:
+    """Parse one Google start/end object. Per the API contract, dateTime may
+    omit the UTC offset when an explicit timeZone field is present."""
+    parsed = datetime.fromisoformat(time_obj["dateTime"])
+    if parsed.tzinfo is None:
+        tz_name = time_obj.get("timeZone")
+        if not tz_name or not isinstance(tz_name, str):
+            raise ValueError(f"dateTime {time_obj['dateTime']!r} has no offset and no timeZone")
+        parsed = parsed.replace(tzinfo=ZoneInfo(tz_name))  # bad name -> KeyError -> malformed
+    return parsed
 
 
 def _attendee_from_item(raw: dict[str, Any]) -> Attendee:
@@ -126,7 +145,7 @@ def _busy_to_slots(busy: list[dict[str, str]]) -> list[TimeSlot]:
             TimeSlot(start=datetime.fromisoformat(b["start"]), end=datetime.fromisoformat(b["end"]))
             for b in busy
         ]
-    except (KeyError, ValueError) as exc:
+    except (KeyError, ValueError, TypeError) as exc:
         raise MalformedResponseError(f"could not parse freebusy intervals: {exc}") from exc
     slots.sort(key=lambda s: s.start)
     merged: list[TimeSlot] = []
@@ -154,15 +173,11 @@ class GoogleCalendarProvider(CalendarProvider):
         refresh_fn: Callable[[], str],
         *,
         http_client: httpx.Client | None = None,
-        sleep_fn: Callable[[float], None] = time.sleep,
-        rng: random.Random | None = None,
     ) -> None:
         self._token_provider = token_provider
         self._refresh_fn = refresh_fn
         self._owns_client = http_client is None
         self._client = http_client or httpx.Client(timeout=10.0)
-        self._sleep_fn = sleep_fn
-        self._rng = rng or random.Random()
 
     def close(self) -> None:
         if self._owns_client:
@@ -196,6 +211,10 @@ class GoogleCalendarProvider(CalendarProvider):
 
     def get_event(self, calendar_id: str, event_id: str) -> Event:
         data = self._json(self._request("GET", self._event_url(calendar_id, event_id)))
+        # events.get returns deleted events with status=cancelled (sometimes
+        # with ONLY the id populated) instead of a 404 - normalize that
+        if data.get("status") == "cancelled":
+            raise NotFoundError(f"event {event_id!r} is cancelled/deleted")
         return self._require_timed_event(data, calendar_id, event_id)
 
     def create_event(self, calendar_id: str, draft: EventDraft) -> Event:
@@ -223,18 +242,23 @@ class GoogleCalendarProvider(CalendarProvider):
         }
         data = self._json(self._request("POST", FREEBUSY_URL, json_body=body))
         calendars = data.get("calendars", {})
+        if not isinstance(calendars, dict):
+            raise MalformedResponseError("freebusy 'calendars' is not a JSON object")
         result: dict[str, list[TimeSlot]] = {}
         for cid in calendar_ids:
             entry = calendars.get(cid)
-            if entry is None or entry.get("errors"):
+            if not isinstance(entry, dict) or entry.get("errors"):
                 raise ProviderError(
                     f"freebusy could not be resolved for calendar {cid!r}; refusing to "
                     "return partial availability (all-or-nothing contract)"
                 )
-            result[cid] = _busy_to_slots(entry.get("busy", []))
+            busy = entry.get("busy", [])
+            if not isinstance(busy, list):
+                raise MalformedResponseError(f"freebusy 'busy' for {cid!r} is not a list")
+            result[cid] = _busy_to_slots(busy)
         return result
 
-    # -- request layer: auth, 401 refresh, retry/backoff ------------------
+    # -- request layer: auth + 401 refresh (retries live in the Toolbox) ----
 
     def _request(
         self,
@@ -244,39 +268,12 @@ class GoogleCalendarProvider(CalendarProvider):
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> httpx.Response:
-        """One logical API call: retried up to _MAX_ATTEMPTS on retryable errors.
-
-        Backoff is exponential with jitter; RateLimitError.retry_after is
-        honored verbatim when present. sleep_fn is injectable so tests can
-        record delays instead of actually sleeping.
-        """
-        for attempt in range(_MAX_ATTEMPTS):
-            try:
-                return self._send_once(method, url, params=params, json_body=json_body)
-            except ProviderError as exc:
-                if not exc.retryable or attempt == _MAX_ATTEMPTS - 1:
-                    raise
-                self._sleep_fn(self._delay_for(exc, attempt))
-        raise AssertionError("unreachable")  # pragma: no cover
-
-    def _delay_for(self, exc: ProviderError, attempt: int) -> float:
-        if isinstance(exc, RateLimitError):
-            return exc.retry_after
-        base = _BACKOFF_BASE_SECONDS * (2**attempt)
-        return base + self._rng.uniform(0, base)
-
-    def _send_once(
-        self,
-        method: str,
-        url: str,
-        *,
-        params: dict[str, Any] | None,
-        json_body: dict[str, Any] | None,
-    ) -> httpx.Response:
         """Send with the current token; on 401, refresh ONCE and resend.
 
         A second 401 means the refreshed token was also rejected, which is
         an AuthError (not retryable) - the user must re-authenticate.
+        Retryable failures (429/5xx/transport) raise immediately; backoff
+        retries are the Toolbox's job, not ours (no retry multiplication).
         """
         response = self._send_authed(method, url, self._token_provider(), params, json_body)
         if response.status_code == 401:
@@ -322,9 +319,15 @@ class GoogleCalendarProvider(CalendarProvider):
 
     @staticmethod
     def _map_403(response: httpx.Response) -> ProviderError:
+        # fully defensive: error bodies are attacker/outage-shaped, so any
+        # deviation from the documented shape degrades to AuthError
         try:
-            errors = response.json().get("error", {}).get("errors", [])
+            data = response.json()
         except ValueError:
+            data = None
+        error = data.get("error") if isinstance(data, dict) else None
+        errors = error.get("errors") if isinstance(error, dict) else None
+        if not isinstance(errors, list):
             errors = []
         reasons = {e.get("reason") for e in errors if isinstance(e, dict)}
         if reasons & _RATE_LIMIT_REASONS:
@@ -343,31 +346,42 @@ class GoogleCalendarProvider(CalendarProvider):
             raise MalformedResponseError("expected a JSON object body")
         return data
 
-    def _event_from_item(self, item: dict[str, Any], calendar_id: str) -> Event | None:
+    def _event_from_item(self, item: Any, calendar_id: str) -> Event | None:
         """Map one API item to an Event; returns None for all-day events.
 
         All-day events carry date-only start/end, which our aware-datetime
-        model cannot represent; list_events skips them gracefully.
+        model cannot represent; list_events skips them gracefully. Any other
+        shape deviation raises MalformedResponseError - never a raw Python
+        exception escaping the provider taxonomy.
         """
-        start_raw = item.get("start", {}).get("dateTime")
-        end_raw = item.get("end", {}).get("dateTime")
-        if start_raw is None or end_raw is None:
-            return None
+        if not isinstance(item, dict):
+            raise MalformedResponseError("event item is not a JSON object")
+        start_obj = item.get("start")
+        end_obj = item.get("end")
+        if not isinstance(start_obj, dict) or not isinstance(end_obj, dict):
+            raise MalformedResponseError("event start/end is not a JSON object")
+        if "dateTime" not in start_obj or "dateTime" not in end_obj:
+            return None  # date-only = all-day
         try:
+            organizer = item.get("organizer") or {}
             return Event(
                 id=item["id"],
                 calendar_id=calendar_id,
-                organizer=item.get("organizer", {}).get("email", calendar_id),
+                organizer=organizer.get("email", calendar_id)
+                if isinstance(organizer, dict)
+                else calendar_id,
                 title=item.get("summary", ""),
                 description=item.get("description", ""),
-                start=datetime.fromisoformat(start_raw),
-                end=datetime.fromisoformat(end_raw),
+                start=_parse_api_datetime(start_obj),
+                end=_parse_api_datetime(end_obj),
                 status=EventStatus(item.get("status", "confirmed")),
                 attendees=[_attendee_from_item(a) for a in item.get("attendees", [])],
                 created_at=_parse_optional_dt(item.get("created")),
                 updated_at=_parse_optional_dt(item.get("updated")),
             )
-        except (KeyError, ValueError) as exc:  # pydantic ValidationError is a ValueError
+        except (KeyError, ValueError, TypeError, AttributeError) as exc:
+            # KeyError: missing field OR unknown ZoneInfo; ValueError covers
+            # pydantic validation; Type/AttributeError cover shape junk
             raise MalformedResponseError(f"could not map event item: {exc}") from exc
 
     def _require_timed_event(self, item: dict[str, Any], calendar_id: str, event_id: str) -> Event:
