@@ -52,7 +52,7 @@
 
 <main id="appui" style="display:none">
   <section id="chatcol">
-    <div id="log"><div class="msg sys">Ask me to book, move, or cancel meetings — or teach me a rule like “never schedule before 10am”.</div></div>
+    <div id="log"><div class="msg sys">Ask me to book, move, or cancel meetings - or teach me a rule like “never schedule before 10am”.</div></div>
     <form id="chat"><input id="box" autocomplete="off" placeholder="Message CalendAI…" /><button>Send</button></form>
   </section>
   <aside>
@@ -121,7 +121,7 @@ async function refreshTraces(){
     d.onclick=async()=>{ const det=await api("/api/traces/"+rq.request_id);
       let pre=d.querySelector("pre"); if(pre){pre.remove();return;}
       pre=document.createElement("pre");
-      pre.textContent=det.spans.map(s=>`${s.kind}  ${s.name}`+(s.rationale?`  — ${s.rationale}`:"")).join("\n");
+      pre.textContent=det.spans.map(s=>`${s.kind}  ${s.name}`+(s.rationale?`  - ${s.rationale}`:"")).join("\n");
       d.appendChild(pre); };
     el.appendChild(d);
   });

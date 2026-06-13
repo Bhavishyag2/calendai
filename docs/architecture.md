@@ -1,4 +1,4 @@
-# CalendAI — Architecture
+# CalendAI - Architecture
 
 CalendAI is a stateful, multi-user AI agent that manages Google Calendar through
 natural language. This document describes how it is put together and why.
@@ -34,8 +34,8 @@ natural language. This document describes how it is put together and why.
                                             └──────────────────┘
 ```
 
-The same `AgentLoop` is driven by three front-ends — the web app, a developer
-REPL (`calendai.cli`), and the evaluation runner (`calendai.evals`) — so every
+The same `AgentLoop` is driven by three front-ends - the web app, a developer
+REPL (`calendai.cli`), and the evaluation runner (`calendai.evals`) - so every
 surface exercises identical agent behaviour.
 
 ## 2. Layers
@@ -51,7 +51,7 @@ end-to-end. `CalendarProvider` is an ABC with a documented error taxonomy
 **Provider implementations (`calendai.providers`).** `GoogleCalendarProvider`
 speaks raw REST over httpx; `FakeCalendarProvider` is a deterministic in-memory
 calendar with Google-faithful invite mirroring and failure injection. They are
-interchangeable behind the ABC — the agent never knows which it is talking to.
+interchangeable behind the ABC - the agent never knows which it is talking to.
 This seam is what makes deterministic, offline evaluation possible.
 
 **Agent core (`calendai.agent`).** A hand-rolled tool-use loop on the Anthropic
@@ -70,9 +70,9 @@ write paths.
 supersession (at most one active fact per `(user, key)`), cipher-enforced OAuth
 token storage, sessions, messages, and traces.
 
-**Tracing (`calendai.traces`).** Every request emits an ordered span stream —
+**Tracing (`calendai.traces`).** Every request emits an ordered span stream -
 `llm_call` (model, stop reason, token usage, latency), `tool_call` (args, ok,
-error type, retries), `memory_op`, and `decision` — each carrying the model's own
+error type, retries), `memory_op`, and `decision` - each carrying the model's own
 one-line rationale. The web trace viewer and the eval trajectory scorer both read
 these.
 
@@ -103,8 +103,8 @@ these.
   pending delete). Questions, conditions, declines, and unrelated replies all
   revoke it. The model cannot self-confirm within a turn. The pending state is
   persisted in SQLite (single-shot, user-scoped, 30-minute TTL), so consent
-  survives the web app rebuilding the agent loop on every request — and even a
-  process restart — rather than living only in the loop's memory. A CLI/eval loop
+  survives the web app rebuilding the agent loop on every request - and even a
+  process restart - rather than living only in the loop's memory. A CLI/eval loop
   that stays resident uses the same code path; the store is simply its backing.
 - **Rule engine.** Stored rules (`no_meetings_before/after`, `no_meetings_on`,
   `max_meeting_minutes`) are re-read fresh on every create/update and enforced
@@ -128,8 +128,8 @@ without Google credentials.
 
 Declarative YAML scenarios define a deterministic world (frozen clock, seeded
 calendar + facts, injectable failures) and user turns across one or more
-sessions. A multi-session scenario simulates a restart — the calendar persists
-while the store is reopened and conversation history cleared — so cross-session
+sessions. A multi-session scenario simulates a restart - the calendar persists
+while the store is reopened and conversation history cleared - so cross-session
 behaviour must come from persisted memory. Three scoring layers: objective
 end-state (calendar + facts), trajectory (tool calls from traces), and an LLM
 judge for response-quality rubrics. A scenario passes only if every repeated run

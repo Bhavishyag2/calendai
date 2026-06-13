@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "calendai"
 version = "0.1.0"
-description = "CalendAI — an intelligent, memory-driven calendar agent"
+description = "CalendAI - an intelligent, memory-driven calendar agent"
 requires-python = ">=3.12"
 dependencies = [
     "anthropic>=0.40",

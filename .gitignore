@@ -1,4 +1,4 @@
-# Environment — never commit secrets
+# Environment - never commit secrets
 .env
 .env.*
 !.env.example
@@ -22,7 +22,7 @@ data/
 .playwright-browsers/
 demo/recordings/
 
-# Demo media — kept local only (large binaries; screenshots show a demo account email)
+# Demo media - kept local only (large binaries; screenshots show a demo account email)
 docs/demo/screenshots/
 docs/demo/video/
 docs/demo/*.aac

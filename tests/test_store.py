@@ -65,7 +65,7 @@ def test_persistence_across_restart(tmp_path, clock):
     """The 'stateful' requirement: facts must survive a process restart.
 
     Simulated by closing the Store (connection) and opening a fresh one on
-    the same file — not just reusing in-process state.
+    the same file - not just reusing in-process state.
     """
     db = tmp_path / "restart.db"
     first = Store(db, clock=clock)

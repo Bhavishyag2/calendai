@@ -1,7 +1,7 @@
 # CalendAI
 
 A stateful, multi-user AI agent that manages Google Calendar through natural
-language. It doesn't just book slots — it remembers that you never take meetings
+language. It doesn't just book slots - it remembers that you never take meetings
 before 10 AM, knows who "Alex" is, applies your rules to every scheduling decision
 without being reminded, and refuses to delete anything until you actually confirm.
 
@@ -18,10 +18,10 @@ handling**, and a **rigorous automated evaluation pipeline**.
   are enforced at the tool layer regardless of what the model decides.
 - **Deterministic evaluation over the real model.** 20 frozen YAML scenarios run the
   real agent against a deterministic fake calendar, scored on objective end-state,
-  tool trajectory, and an LLM judge — producing `EVALUATION.md` with success rates
+  tool trajectory, and an LLM judge - producing `EVALUATION.md` with success rates
   and failure analysis.
 - **Full tracing.** Every request records its LLM calls (tokens, latency), tool
-  calls (args, retries), and the model's own rationale — visible in the web UI.
+  calls (args, retries), and the model's own rationale - visible in the web UI.
 
 See [`docs/architecture.md`](docs/architecture.md), [`docs/tradeoffs.md`](docs/tradeoffs.md),
 and [`docs/evaluation.md`](docs/evaluation.md).
@@ -44,7 +44,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 ## Try it
 
-**Developer REPL** (real model, fake calendar — no Google needed):
+**Developer REPL** (real model, fake calendar - no Google needed):
 
 ```bash
 python -m calendai.cli --user you@example.com

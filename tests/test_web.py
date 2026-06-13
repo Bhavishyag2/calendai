@@ -45,7 +45,7 @@ class WebAgentClient:
             return text_response(self.CONTACT if "alex" in user else "[]")
         last = messages[-1]["content"]
         if isinstance(last, list) and last and last[0].get("type") == "tool_result":
-            return text_response("Done — booked your standup.")
+            return text_response("Done - booked your standup.")
         text = (last if isinstance(last, str) else "").lower()
         if "book" in text:
             return tool_call(
@@ -283,7 +283,7 @@ class ConfirmDeleteClient:
             result = json.loads(last[0]["content"])
             if result.get("error_type") == "confirmation_required":
                 return text_response("This will permanently delete your standup. Confirm?")
-            return text_response("Done — your standup has been deleted.")
+            return text_response("Done - your standup has been deleted.")
         token_match = re.search(r"confirmation_token='(confirm-[0-9a-f]+)'", system or "")
         args = {"event_id": self.event_id, "rationale": "user asked to delete the standup"}
         if token_match:  # the gate armed a token after the user confirmed

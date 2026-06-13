@@ -372,7 +372,7 @@ def test_scenario_rejects_undeclared_user_reference():
 
 def test_judge_parsing_is_first_token_only():
     # "PASSABLE" / "PASS but..." must not count as PASS
-    tricky = ScriptedJudge(["PASSABLE thing", "PASS — but it actually fails"])
+    tricky = ScriptedJudge(["PASSABLE thing", "PASS - but it actually fails"])
     res = scorers.score_judge(
         [JudgeRubric(criterion="a"), JudgeRubric(criterion="b")],
         ["reply"],
@@ -380,4 +380,4 @@ def test_judge_parsing_is_first_token_only():
         "m",
     )
     assert not res[0].passed  # "PASSABLE" rejected
-    assert res[1].passed  # "PASS —" is a clean first-token PASS
+    assert res[1].passed  # "PASS -" is a clean first-token PASS

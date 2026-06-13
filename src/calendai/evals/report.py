@@ -29,7 +29,7 @@ def render_report(
 ) -> str:
     scen_pass, scen_total, run_pass, run_total = _overall(results)
     lines: list[str] = []
-    lines.append("# CalendAI — Evaluation Report")
+    lines.append("# CalendAI - Evaluation Report")
     lines.append("")
     lines.append(f"_Generated {generated_at}_")
     lines.append("")
@@ -37,7 +37,7 @@ def render_report(
     lines.append(f"- **Utility model (extraction + judge):** `{utility_model}`")
     lines.append(
         f"- **Scenarios passed:** {scen_pass}/{scen_total} ({_pct(scen_pass, scen_total)})  "
-        "— a scenario passes only if every repeated run passes (no flakiness allowed)."
+        "- a scenario passes only if every repeated run passes (no flakiness allowed)."
     )
     lines.append(
         f"- **Individual runs passed:** {run_pass}/{run_total} ({_pct(run_pass, run_total)})"
@@ -93,7 +93,7 @@ def _failure_section(results: list[ScenarioResult]) -> str:
         lines.append("")
         return "\n".join(lines)
     for r in failing:
-        lines.append(f"### `{r.scenario_id}` — {r.description}")
+        lines.append(f"### `{r.scenario_id}` - {r.description}")
         run_pass = sum(1 for run in r.runs if run.passed)
         lines.append(f"Passed {run_pass}/{len(r.runs)} runs. Distinct failing checks:")
         lines.append("")
@@ -111,6 +111,6 @@ def _unique_failures(result: ScenarioResult) -> list[str]:
         for check in run.checks:
             if not check.passed:
                 key = f"{check.layer}::{check.name}"
-                detail = f" — {check.detail}" if check.detail else ""
+                detail = f" - {check.detail}" if check.detail else ""
                 seen.setdefault(key, f"**[{check.layer}]** {check.name}{detail}")
     return list(seen.values())
