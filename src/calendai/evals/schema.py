@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from calendai.core.models import UtcDatetime
 
@@ -113,6 +113,24 @@ class Scenario(BaseModel):
             if u.email == email:
                 return u
         raise KeyError(f"scenario {self.id!r} references unknown user {email!r}")
+
+    @model_validator(mode="after")
+    def _users_are_declared(self) -> Scenario:
+        """Every email referenced anywhere must be a declared user - catches
+        typos that would otherwise become confusing failures or false
+        absent-checks in a frozen scenario."""
+        declared = {u.email for u in self.users}
+        referenced = (
+            {e.user for e in self.seed_events}
+            | {f.user for f in self.seed_facts}
+            | {s.user for s in self.sessions}
+            | {e.user for e in self.expect.events}
+            | {f.user for f in self.expect.facts}
+        )
+        unknown = referenced - declared
+        if unknown:
+            raise ValueError(f"scenario {self.id!r} references undeclared users: {sorted(unknown)}")
+        return self
 
 
 def load_scenario(path: str | Path) -> Scenario:

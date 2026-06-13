@@ -305,3 +305,56 @@ def test_packaged_scenarios_load_and_are_unique():
     assert len(scenarios) >= 18  # the brief asks for a substantial suite
     for s in scenarios:
         assert s.users and s.sessions  # every scenario is runnable
+
+
+# -- gate-5 soundness fixes ---------------------------------------------------
+
+
+def test_zero_check_run_does_not_pass_vacuously():
+    # a run that scored nothing (e.g. a judge-only scenario under --no-judge)
+    # must NOT report a green
+    assert RunResult(run_index=0, checks=[]).passed is False
+    sr = ScenarioResult(scenario_id="x", description="d", runs=[RunResult(run_index=0, checks=[])])
+    assert sr.passed is False
+
+
+def test_judge_only_scenario_fails_when_judge_disabled():
+    judge_only = _memory_scenario().model_copy(
+        update={
+            "expect": Expectations(judge=[JudgeRubric(criterion="acknowledges the rule")]),
+        }
+    )
+    result = run_scenario(
+        judge_only,
+        agent_client=StatefulAgentClient(),
+        agent_model="scripted-agent",
+        utility_client=StatefulUtilityClient(),
+        utility_model="scripted-utility",
+        run_judge=False,
+    )
+    assert not result.passed  # nothing was scored -> not a vacuous pass
+
+
+def test_scenario_rejects_undeclared_user_reference():
+    import pytest
+
+    with pytest.raises(ValueError, match="undeclared users"):
+        Scenario(
+            id="typo",
+            description="references a user that is not declared",
+            users=[UserSpec(email="alice@example.com")],
+            sessions=[Session(user="alcie@example.com", turns=["hi"])],  # typo
+        )
+
+
+def test_judge_parsing_is_first_token_only():
+    # "PASSABLE" / "PASS but..." must not count as PASS
+    tricky = ScriptedJudge(["PASSABLE thing", "PASS — but it actually fails"])
+    res = scorers.score_judge(
+        [JudgeRubric(criterion="a"), JudgeRubric(criterion="b")],
+        ["reply"],
+        tricky,
+        "m",
+    )
+    assert not res[0].passed  # "PASSABLE" rejected
+    assert res[1].passed  # "PASS —" is a clean first-token PASS

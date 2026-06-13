@@ -8,6 +8,7 @@ the objective layers fully unit-testable offline.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from calendai.core.models import Event, MemoryFact
@@ -207,7 +208,9 @@ def _judge_once(client: Any, model: str, criterion: str, reply: str) -> tuple[bo
         messages=[{"role": "user", "content": user}],
     )
     text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
-    return text.strip().upper().startswith("PASS"), text.strip()
+    # first-token match: "PASS" / "FAIL" only - not "PASSABLE" or "PASS but no"
+    verdict = re.match(r"\s*PASS\b", text, re.IGNORECASE) is not None
+    return verdict, text.strip()
 
 
 __all__ = [

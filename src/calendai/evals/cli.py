@@ -39,8 +39,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", default=str(DEFAULT_OUT))
     parser.add_argument("--filter", default=None, help="only run scenarios whose id/tags match")
     parser.add_argument("--no-judge", action="store_true", help="skip LLM-judge checks")
-    parser.add_argument("--runs", type=int, default=None, help="override runs-per-scenario")
+    parser.add_argument("--runs", type=int, default=None, help="override runs-per-scenario (1-5)")
     args = parser.parse_args(argv)
+    if args.runs is not None and not (1 <= args.runs <= 5):
+        parser.error("--runs must be between 1 and 5 (this spends real API tokens)")
 
     import anthropic  # local import: the harness tests never need the SDK
 

@@ -20,7 +20,10 @@ class RunResult(BaseModel):
 
     @property
     def passed(self) -> bool:
-        return self.error is None and all(c.passed for c in self.checks)
+        # zero checks is NOT a pass: a scenario whose only expectations are
+        # judge rubrics, run with --no-judge, scores nothing and must not
+        # report a vacuous green.
+        return self.error is None and bool(self.checks) and all(c.passed for c in self.checks)
 
 
 class ScenarioResult(BaseModel):
