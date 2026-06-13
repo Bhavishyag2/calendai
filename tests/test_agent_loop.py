@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from calendai.agent.loop import BAIL_MESSAGE, MAX_ITERATIONS, AgentLoop
+from calendai.agent.loop import BAIL_MESSAGE, MAX_ITERATIONS, NO_REPLY, AgentLoop
 from calendai.agent.tools import Toolbox
 from calendai.core.models import EventDraft, User
 from calendai.core.provider import RateLimitError, ServerError
@@ -80,6 +80,34 @@ def test_create_event_via_tool(harness, provider):
     assert tool_span["payload"]["ok"] is True
     assert tool_span["rationale"] == "User asked for a standup."
     assert "rationale" not in tool_span["payload"]["args"]
+
+
+def test_silent_turn_after_mutation_becomes_a_confirmation(harness):
+    # A cheaper model can end the turn with no text right after a successful
+    # tool call. The user must still get a confirmation, never "(no response)".
+    loop, client = harness(
+        [
+            tool_call(
+                "save_profile_fact",
+                {
+                    "fact_type": "rule",
+                    "key": "rule:no_meetings_before",
+                    "value": {"time": "10:00", "timezone": "Asia/Kolkata"},
+                    "statement": "Never schedule before 10:00",
+                },
+            ),
+            text_response(""),  # model says nothing after the save
+        ]
+    )
+    reply = loop.run_turn("never schedule me before 10am")
+    assert reply != NO_REPLY
+    assert reply == "Done - I've saved that to your profile."
+
+
+def test_silent_turn_with_no_mutation_stays_no_reply(harness):
+    # No side effect + no text is a genuinely empty turn; don't fabricate one.
+    loop, client = harness([text_response("")])
+    assert loop.run_turn("...") == NO_REPLY
 
 
 def test_history_persists_across_turns(harness):

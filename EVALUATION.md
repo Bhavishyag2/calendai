@@ -94,6 +94,42 @@ failures: weaker clarification, less reliable multi-turn confirmation completion
 and less reliable post-turn fact extraction (which makes the cross-session memory
 scenario flaky). None are safety breaches.
 
+## Demo capture (and why it runs on Sonnet)
+
+The recorded walkthrough in [`docs/demo/`](docs/demo/) (a continuous video plus a
+screenshot per step) is captured against a **real Google Calendar**, with the
+agent model set to `claude-sonnet-4-6` — even though the project's `.env` default
+runs Haiku. This is the same cost/capability lever measured above, applied to a
+one-time deliverable, and the reason is concrete.
+
+The demo is a multi-step happy path: book → teach a rule → **restart the server** →
+rule-blocked booking → confirm-gated delete → trace audit. Completing it end-to-end
+depends on the agent making the right tool call at every step, and Haiku's
+documented weaknesses surface exactly there. We hit them repeatedly while
+capturing (no clean Haiku run in four attempts):
+
+- **Skipped the first destructive call.** The two-step confirmation requires the
+  model to call `delete_event` *once without a token* — that call is what arms the
+  gate — before telling the user. Haiku sometimes asks for confirmation in prose
+  *without* that call, so the user's "yes" has nothing to confirm and the delete
+  never completes. This is the same failure the suite records as `delete_confirmed`
+  (Haiku **0/2**).
+- **Silent turn after a successful tool call.** Haiku occasionally ends a turn with
+  no text right after saving a fact. (We hardened the loop to surface a concise
+  confirmation instead of an empty "(no response)", but the underlying behaviour is
+  the model's.)
+- **Non-canonical / missed fact extraction.** Occasionally the rule isn't saved
+  under the enforced `rule:no_meetings_before` key, weakening downstream
+  enforcement — mirroring `rule_taught_then_enforced` (Haiku **1/2**).
+
+Crucially, **none of these are safety failures.** Across every Haiku run, no event
+was deleted without a validated confirmation token and no rule-violating booking
+was created — the code-enforced guards held; the failures were about *finishing*
+the task, not bypassing a guard. Sonnet (95% vs 65%) completes the same flow
+reliably in a single run, so it is the right model for a one-shot showcase. The
+utility model (extraction + judge) stays Haiku, and the eval table above is
+unchanged — it remains the honest, both-tiers measurement.
+
 ## Run-to-run variance
 
 Objective end-state checks are stable; the **judge-scored** scenarios sit nearer

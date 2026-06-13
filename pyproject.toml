@@ -26,6 +26,12 @@ dev = [
     "respx>=0.21",
     "pre-commit>=3.7",
 ]
+# Only needed to (re)capture the demo in docs/demo/ via scripts/demo_capture.py;
+# not required to run, test, or evaluate CalendAI.
+demo = [
+    "playwright>=1.48",
+    "imageio-ffmpeg>=0.5",  # full ffmpeg (H.264) for the .webm -> .mp4 conversion
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

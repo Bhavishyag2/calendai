@@ -306,6 +306,80 @@ def test_gate_mismatched_action_echo_does_not_arm():
     assert "cancelled" in gate.prompt_context()
 
 
+# -- store-bound gate: survives the web app's per-request rebuild ------------------
+# The web app builds a fresh ConfirmationGate every request, so the consent
+# state has to round-trip through the store. These mirror the in-memory gate
+# tests above but across separate gate instances sharing one store.
+
+
+def test_persistent_gate_confirm_survives_rebuild(store, clock):
+    store.upsert_user(ALICE)
+    g1 = ConfirmationGate(store=store, user_id=ALICE.id)
+    g1.new_turn("delete the standup")
+    token = g1.request("delete_event", "fp1", "{}")
+    g2 = ConfirmationGate(store=store, user_id=ALICE.id)  # next request: new instance
+    g2.new_turn("yes, delete it")
+    assert "confirms the pending delete_event" in g2.prompt_context()
+    assert g2.validate(token, "delete_event", "fp1") is True
+    g3 = ConfirmationGate(store=store, user_id=ALICE.id)  # single-shot: gone next turn
+    g3.new_turn("anything")
+    assert g3.validate(token, "delete_event", "fp1") is False
+
+
+def test_persistent_gate_decline_cancels_across_rebuild(store, clock):
+    store.upsert_user(ALICE)
+    g1 = ConfirmationGate(store=store, user_id=ALICE.id)
+    g1.new_turn("delete it")
+    token = g1.request("delete_event", "fp1", "{}")
+    g2 = ConfirmationGate(store=store, user_id=ALICE.id)
+    g2.new_turn("no, keep it")
+    assert "cancelled" in g2.prompt_context()
+    assert g2.validate(token, "delete_event", "fp1") is False
+
+
+def test_persistent_gate_unrelated_reply_cancels(store, clock):
+    store.upsert_user(ALICE)
+    g1 = ConfirmationGate(store=store, user_id=ALICE.id)
+    g1.new_turn("delete it")
+    g1.request("delete_event", "fp1", "{}")
+    g2 = ConfirmationGate(store=store, user_id=ALICE.id)
+    g2.new_turn("what's on my calendar tomorrow?")
+    assert g2.prompt_context().endswith("the confirmation flow restarts.")
+    # consumed regardless: nothing lingers in the store
+    assert store.conn.execute("SELECT COUNT(*) c FROM pending_confirmations").fetchone()["c"] == 0
+
+
+def test_persistent_gate_is_user_scoped(store, clock):
+    store.upsert_user(ALICE)
+    bob = User(id="u_bob2", email="bob2@example.com", display_name="Bob")
+    store.upsert_user(bob)
+    ga = ConfirmationGate(store=store, user_id=ALICE.id)
+    ga.new_turn("delete it")
+    token = ga.request("delete_event", "fp1", "{}")
+    # Bob confirming on HIS turn must never arm Alice's pending action
+    gb = ConfirmationGate(store=store, user_id=bob.id)
+    gb.new_turn("yes, delete it")
+    assert gb.prompt_context() == ""  # Bob had nothing pending
+    assert gb.validate(token, "delete_event", "fp1") is False
+    # Alice's token is untouched and still armable on HER next turn
+    ga2 = ConfirmationGate(store=store, user_id=ALICE.id)
+    ga2.new_turn("yes, delete it")
+    assert ga2.validate(token, "delete_event", "fp1") is True
+
+
+def test_persistent_gate_ttl_expires_stale_confirmation(store, clock):
+    store.upsert_user(ALICE)
+    g1 = ConfirmationGate(store=store, user_id=ALICE.id)
+    g1.new_turn("delete it")
+    token = g1.request("delete_event", "fp1", "{}")
+    clock.advance(timedelta(hours=1))  # well past the 30-minute TTL
+    g2 = ConfirmationGate(store=store, user_id=ALICE.id)
+    g2.new_turn("yes, delete it")
+    assert g2.prompt_context() == ""  # too old to arm
+    assert g2.validate(token, "delete_event", "fp1") is False
+    assert store.conn.execute("SELECT COUNT(*) c FROM pending_confirmations").fetchone()["c"] == 0
+
+
 # -- retry accounting (trace field) ------------------------------------------------
 
 

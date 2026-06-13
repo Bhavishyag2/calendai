@@ -101,7 +101,11 @@ these.
   explicit, leading affirmative drawn from a closed consent vocabulary, with the
   echoed action matching the pending one ("yes, update it" cannot authorize a
   pending delete). Questions, conditions, declines, and unrelated replies all
-  revoke it. The model cannot self-confirm within a turn.
+  revoke it. The model cannot self-confirm within a turn. The pending state is
+  persisted in SQLite (single-shot, user-scoped, 30-minute TTL), so consent
+  survives the web app rebuilding the agent loop on every request — and even a
+  process restart — rather than living only in the loop's memory. A CLI/eval loop
+  that stays resident uses the same code path; the store is simply its backing.
 - **Rule engine.** Stored rules (`no_meetings_before/after`, `no_meetings_on`,
   `max_meeting_minutes`) are re-read fresh on every create/update and enforced
   with interval-overlap semantics (an overnight event cannot slip past a

@@ -50,6 +50,22 @@ CREATE TABLE IF NOT EXISTS memory_facts (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_active_key
     ON memory_facts(user_id, key) WHERE active = 1;
 
+-- Destructive-action consent that must survive between HTTP requests. The web
+-- app rebuilds the agent loop (and its in-memory ConfirmationGate) on every
+-- /api/chat call, so a token issued on the "delete?" turn would otherwise be
+-- lost before the "yes" turn. A row here is single-shot: it is consumed (and
+-- deleted) at the start of the user's very next turn.
+CREATE TABLE IF NOT EXISTS pending_confirmations (
+    token       TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    action      TEXT NOT NULL CHECK (action IN ('update_event', 'delete_event')),
+    fingerprint TEXT NOT NULL,  -- sha256 of the canonical args; consent binds to these exact args
+    summary     TEXT NOT NULL,  -- canonical args JSON, re-shown to the model next turn
+    created_at  TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_conf_user ON pending_confirmations(user_id);
+
 CREATE TABLE IF NOT EXISTS trace_requests (
     request_id   TEXT PRIMARY KEY,
     user_id      TEXT,

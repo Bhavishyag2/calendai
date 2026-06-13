@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -21,6 +21,12 @@ from calendai.core.models import FactType, MemoryFact, User
 
 def _iso(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat()
+
+
+# A destructive-action confirmation is meant for the user's immediate next
+# reply. This TTL is the safety backstop: a confirmation abandoned mid-flow is
+# still cleaned up, but it can never arm hours/days later on a stray "yes".
+PENDING_CONFIRMATION_TTL = timedelta(minutes=30)
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -232,6 +238,50 @@ class Store:
             (user_id, limit),
         ).fetchall()
         return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+    # -- pending confirmations (cross-request destructive-action consent) --
+
+    def add_pending_confirmation(
+        self, user_id: str, token: str, action: str, fingerprint: str, summary: str
+    ) -> None:
+        """Persist a destructive-action confirmation issued this turn so it
+        survives until the user's next request (the web loop is rebuilt per
+        request, dropping the in-memory gate)."""
+        self._conn.execute(
+            """INSERT INTO pending_confirmations
+                   (token, user_id, action, fingerprint, summary, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (token, user_id, action, fingerprint, summary, _iso(self._clock.now())),
+        )
+        self._conn.commit()
+
+    def take_pending_confirmations(self, user_id: str) -> list[dict[str, str]]:
+        """Return AND delete every pending confirmation for the user.
+
+        A single `DELETE ... RETURNING` is one atomic statement under one write
+        lock - no SELECT-then-DELETE window where a concurrent writer could
+        double-read or insert between the two. Consuming on read gives the same
+        single-shot semantics the in-memory gate has: a confirmation is valid
+        for exactly the turn after it was issued, whether the user confirms,
+        declines, or changes the subject. Rows older than the TTL are still
+        deleted (cleanup) but never returned, so they can never arm later."""
+        cutoff = _iso(self._clock.now() - PENDING_CONFIRMATION_TTL)
+        rows = self._conn.execute(
+            """DELETE FROM pending_confirmations WHERE user_id = ?
+               RETURNING token, action, fingerprint, summary, created_at""",
+            (user_id,),
+        ).fetchall()
+        self._conn.commit()
+        return [
+            {
+                "token": r["token"],
+                "action": r["action"],
+                "fingerprint": r["fingerprint"],
+                "summary": r["summary"],
+            }
+            for r in rows
+            if r["created_at"] >= cutoff  # ISO-8601 UTC strings sort chronologically
+        ]
 
     # -- oauth tokens (encryption enforced by API shape) ----------------
 

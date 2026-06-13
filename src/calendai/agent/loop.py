@@ -32,6 +32,9 @@ BAIL_MESSAGE = (
     "I wasn't able to finish that request - I hit my internal step limit. "
     "Nothing was changed. Could you rephrase or split the request?"
 )
+# Returned by _text_of when the model emits no text at all. Smaller/cheaper
+# models occasionally end a turn silently right after a successful tool call.
+NO_REPLY = "(no response)"
 
 
 class AgentLoop:
@@ -98,6 +101,11 @@ class AgentLoop:
                 with self.tracer.span(request_id, SpanKind.DECISION, "loop_guard") as span:
                     span.rationale = f"hit MAX_ITERATIONS={MAX_ITERATIONS}; bailing gracefully"
                 final_text = self._bail_message()
+            if final_text == NO_REPLY and self.toolbox.mutations_this_turn:
+                # The model finished a turn without any text, but a tool call
+                # already changed something. Never leave the user with an empty
+                # reply after a real side effect - acknowledge it concretely.
+                final_text = _confirm_mutations(self.toolbox.mutations_this_turn)
             self._extract_memory(request_id, user_text, final_text)
             return final_text
         finally:
@@ -176,7 +184,29 @@ class AgentLoop:
 
 def _text_of(response: Any) -> str:
     parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-    return "\n".join(parts).strip() or "(no response)"
+    return "\n".join(parts).strip() or NO_REPLY
+
+
+# Maps the Toolbox's internal mutation log to a clean, user-facing confirmation
+# (no event IDs or internal keys leak). Used only as a fallback when the model
+# itself produced no closing sentence.
+_MUTATION_PHRASES = (
+    ("created event", "booked the event"),
+    ("updated event", "updated the event"),
+    ("deleted event", "deleted the event"),
+    ("saved profile fact", "saved that to your profile"),
+)
+
+
+def _confirm_mutations(mutations: list[str]) -> str:
+    phrases: list[str] = []
+    for mutation in mutations:
+        phrase = next((p for prefix, p in _MUTATION_PHRASES if mutation.startswith(prefix)), None)
+        if phrase and phrase not in phrases:
+            phrases.append(phrase)
+    if not phrases:
+        return "Done."
+    return "Done - I've " + ", ".join(phrases) + "."
 
 
 def _tool_result_block(tool_use_id: str, outcome: ToolOutcome) -> dict[str, Any]:

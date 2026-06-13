@@ -251,15 +251,33 @@ class ConfirmationGate:
        and only during that one turn.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, store: Store | None = None, user_id: str | None = None) -> None:
         self.turn = 0
         self._pending: dict[str, dict[str, Any]] = {}  # issued this turn
         self._armed: dict[str, dict[str, Any]] = {}  # user-consented; this turn only
         self._context_lines: list[str] = []
+        # When bound to a store (the web app, which rebuilds the gate every
+        # request), pending confirmations are persisted there and survive
+        # across requests. Unbound (CLI/eval/unit tests on one long-lived
+        # gate), the in-memory dicts above carry the same state. Either way
+        # the semantics are identical: valid for exactly the next turn.
+        self._store = store
+        self._user_id = user_id
+
+    def _persistent(self) -> bool:
+        return self._store is not None and self._user_id is not None
 
     def new_turn(self, user_text: str = "") -> None:
         self.turn += 1
-        pending, self._pending = self._pending, {}
+        if self._persistent():
+            rows = self._store.take_pending_confirmations(self._user_id)  # type: ignore[union-attr,arg-type]
+            pending = {
+                r["token"]: {"action": r["action"], "fp": r["fingerprint"], "summary": r["summary"]}
+                for r in rows
+            }
+            self._pending = {}
+        else:
+            pending, self._pending = self._pending, {}
         self._armed = {}
         self._context_lines = []
         # Consent is evaluated PER pending action: an action echo in the
@@ -288,6 +306,10 @@ class ConfirmationGate:
         # consent + argument-fingerprint checks in validate)
         token = f"confirm-{secrets.token_hex(8)}"
         self._pending[token] = {"action": action, "fp": fingerprint, "summary": summary}
+        if self._persistent():
+            self._store.add_pending_confirmation(  # type: ignore[union-attr]
+                self._user_id, token, action, fingerprint, summary  # type: ignore[arg-type]
+            )
         return token
 
     def validate(self, token: str | None, action: str, fingerprint: str) -> bool:
@@ -358,7 +380,9 @@ class Toolbox:
         self.user = user
         self.clock = clock
         self.rule_checker = rule_checker
-        self.gate = ConfirmationGate()
+        # Bind the gate to the store so destructive-action consent survives the
+        # web app's per-request loop rebuild (and a process restart).
+        self.gate = ConfirmationGate(store=store, user_id=user.id)
         self._sleep = sleep_fn
         self._rng = rng or random.Random(0)
         # observability: total provider retries within the current tool call;

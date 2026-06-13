@@ -26,6 +26,9 @@ demo/recordings/
 .claude/settings.local.json
 CLAUDE.local.md
 
+# Internal working notes / private prep (session state, review prompts, cheat sheet)
+docs/plans/
+
 # OS
 Thumbs.db
 .DS_Store

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from datetime import timedelta
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
@@ -11,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from calendai.auth.google_oauth import TOKEN_ENDPOINT, USERINFO_ENDPOINT
 from calendai.core.config import Settings
+from calendai.core.models import EventDraft
 from calendai.db.store import Store
 from calendai.providers.fake import FakeCalendarProvider, sequential_ids
 from calendai.web.app import create_app
@@ -255,6 +258,77 @@ def test_oauth_callback_handles_user_denied_consent(app_client):
         follow_redirects=False,
     )
     assert r.status_code == 400 and "not completed" in r.json()["detail"]
+
+
+# -- destructive-action confirmation across requests (cross-request gate) -----
+
+
+class ConfirmDeleteClient:
+    """Drives the two-turn delete flow the way a real model would, but
+    deterministically: it issues delete_event without a token, relays the
+    confirmation_required result, and on the turn where the system prompt
+    carries an armed token (placed there by the persisted gate) it re-issues
+    delete_event with that exact token. Used to prove the confirmation gate
+    survives the web app's per-request loop rebuild."""
+
+    def __init__(self, event_id: str):
+        self.event_id = event_id
+        self.messages = self
+
+    def create(self, *, messages, system=None, **kwargs):
+        if system and "extract durable profile facts" in system.lower():
+            return text_response("[]")
+        last = messages[-1]["content"]
+        if isinstance(last, list) and last and last[0].get("type") == "tool_result":
+            result = json.loads(last[0]["content"])
+            if result.get("error_type") == "confirmation_required":
+                return text_response("This will permanently delete your standup. Confirm?")
+            return text_response("Done — your standup has been deleted.")
+        token_match = re.search(r"confirmation_token='(confirm-[0-9a-f]+)'", system or "")
+        args = {"event_id": self.event_id, "rationale": "user asked to delete the standup"}
+        if token_match:  # the gate armed a token after the user confirmed
+            args["confirmation_token"] = token_match.group(1)
+        return tool_call("delete_event", args)
+
+
+def test_confirmation_gate_survives_per_request_rebuild(tmp_path, clock, env):
+    # Each /api/chat request rebuilds the loop + ConfirmationGate from scratch,
+    # so the pending confirmation MUST round-trip through the store, or the
+    # "yes" turn can never recover the token. This test fails (infinite
+    # re-confirmation) if the gate keeps its pending state only in memory.
+    settings = Settings(
+        anthropic_api_key="test",
+        calendai_fernet_key=Fernet.generate_key().decode(),
+    )
+    store = Store(tmp_path / "confirm.db", clock=clock, check_same_thread=False)
+    fake = FakeCalendarProvider(clock, sequential_ids())
+    # seed an event to delete
+    event = fake.create_event(
+        "alice@example.com",
+        EventDraft(title="Standup", start=FROZEN_NOW, end=FROZEN_NOW + timedelta(minutes=30)),
+    )
+    app = create_app(
+        settings=settings,
+        clock=clock,
+        agent_client=ConfirmDeleteClient(event.id),
+        store=store,
+        shared_fake=fake,
+    )
+    with TestClient(app) as tc:
+        _dev_login(tc)
+        # turn 1: ask to delete -> gate issues a token, persisted, and asks to confirm
+        r1 = tc.post("/api/chat", json={"message": "delete my standup"})
+        assert r1.status_code == 200 and "confirm" in r1.json()["reply"].lower()
+        n_pending = store.conn.execute("SELECT COUNT(*) c FROM pending_confirmations").fetchone()
+        assert n_pending["c"] == 1
+        # turn 2: confirm -> a FRESH gate recovers the token from the store and deletes
+        r2 = tc.post("/api/chat", json={"message": "yes, delete it"})
+        assert r2.status_code == 200 and "deleted" in r2.json()["reply"].lower()
+
+    # the event is really gone, and the one-shot confirmation was consumed
+    remaining = fake.list_events("alice@example.com", FROZEN_NOW, FROZEN_NOW.replace(day=20))
+    assert remaining == []
+    assert store.conn.execute("SELECT COUNT(*) c FROM pending_confirmations").fetchone()["c"] == 0
 
 
 @respx.mock
