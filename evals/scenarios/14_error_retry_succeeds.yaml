@@ -1,0 +1,22 @@
+id: error_retry_succeeds
+description: A transient rate-limit on create is retried transparently and the booking lands
+tags: [error_handling]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+inject_failures:
+  - action: create_event
+    error: rate_limit
+    times: 1
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Book a standup tomorrow at 10am for 30 minutes."
+expect:
+  events:
+    - user: alice@example.com
+      title_contains: standup
+      start: "2026-06-16T10:00:00+05:30"
+  trajectory:
+    must_call: [create_event]

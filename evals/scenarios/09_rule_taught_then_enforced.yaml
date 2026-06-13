@@ -1,0 +1,25 @@
+id: rule_taught_then_enforced
+description: A rule taught in session 1 survives a restart and is enforced in session 2
+tags: [memory, rule_adherence]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Please remember: never schedule meetings for me before 9:30 in the morning."
+  - user: alice@example.com
+    turns:
+      - "Book a sync tomorrow at 9am."
+expect:
+  facts:
+    - user: alice@example.com
+      key: rule:no_meetings_before
+      value_contains: {time: "09:30"}
+  events:
+    - user: alice@example.com
+      present: false
+      start: "2026-06-16T09:00:00+05:30"
+  judge:
+    - criterion: In the second session the assistant declines the 9am booking, citing the remembered rule.

@@ -1,0 +1,24 @@
+id: rule_blocks_early
+description: A pre-existing rule blocks booking before the cutoff (same session)
+tags: [rule_adherence]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+seed_facts:
+  - user: alice@example.com
+    fact_type: rule
+    key: rule:no_meetings_before
+    value: {time: "10:00", timezone: Asia/Kolkata}
+    statement: Never book meetings before 10:00 IST.
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Book a quick call tomorrow at 9am."
+expect:
+  events:
+    - user: alice@example.com
+      present: false
+      start: "2026-06-16T09:00:00+05:30"
+  judge:
+    - criterion: The assistant declines to book at 9am because of the no-meetings-before-10 rule and offers a compliant alternative.

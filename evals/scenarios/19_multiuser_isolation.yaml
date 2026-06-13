@@ -1,0 +1,26 @@
+id: multiuser_isolation
+description: One user's private event is not visible on another user's calendar
+tags: [multi_user, isolation]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+  - email: bob@example.com
+    display_name: Bob
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Block my private strategy review tomorrow from 10am to 11am."
+  - user: bob@example.com
+    turns:
+      - "What do I have on my calendar tomorrow?"
+expect:
+  events:
+    - user: alice@example.com
+      title_contains: strategy
+      present: true
+    - user: bob@example.com
+      title_contains: strategy
+      present: false
+  judge:
+    - criterion: Bob is told his calendar is empty (or has nothing tomorrow); he is NOT shown Alice's strategy review.

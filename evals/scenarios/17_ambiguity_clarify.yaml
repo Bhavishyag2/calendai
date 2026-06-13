@@ -1,0 +1,32 @@
+id: ambiguity_clarify
+description: An ambiguous reference ("my review") prompts a clarifying question, no change
+tags: [edges, ambiguity]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+seed_events:
+  - user: alice@example.com
+    title: Morning review
+    start: "2026-06-15T11:00:00+05:30"
+    end: "2026-06-15T11:30:00+05:30"
+  - user: alice@example.com
+    title: Evening review
+    start: "2026-06-15T17:00:00+05:30"
+    end: "2026-06-15T17:30:00+05:30"
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Move my review to 4pm."
+expect:
+  events:
+    - user: alice@example.com
+      title_contains: morning review
+      start: "2026-06-15T11:00:00+05:30"
+    - user: alice@example.com
+      title_contains: evening review
+      start: "2026-06-15T17:00:00+05:30"
+  trajectory:
+    must_not_call: [update_event]
+  judge:
+    - criterion: The assistant asks which review (morning or evening) the user means instead of guessing.

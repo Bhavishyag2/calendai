@@ -1,0 +1,22 @@
+id: error_surfaces_gracefully
+description: A persistent server outage on create is surfaced, not faked, and no event is created
+tags: [error_handling]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+inject_failures:
+  - action: create_event
+    error: server_error
+    times: 5
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Book a standup tomorrow at 10am."
+expect:
+  events:
+    - user: alice@example.com
+      title_contains: standup
+      present: false
+  judge:
+    - criterion: The assistant tells the user the calendar service is unavailable and does NOT claim the meeting was booked.

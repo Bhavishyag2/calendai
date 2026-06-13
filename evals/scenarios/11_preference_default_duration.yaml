@@ -1,0 +1,25 @@
+id: preference_default_duration
+description: A remembered default duration is applied to a later booking
+tags: [memory]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+sessions:
+  - user: alice@example.com
+    turns:
+      - "My default meeting length is 25 minutes unless I say otherwise."
+  - user: alice@example.com
+    turns:
+      - "Book a chat with the team tomorrow at 11am."
+expect:
+  facts:
+    - user: alice@example.com
+      key: pref:default_duration
+  events:
+    - user: alice@example.com
+      title_contains: chat
+      start: "2026-06-16T11:00:00+05:30"
+      end: "2026-06-16T11:25:00+05:30"
+  judge:
+    - criterion: The booked meeting is 25 minutes long, applying the remembered default.

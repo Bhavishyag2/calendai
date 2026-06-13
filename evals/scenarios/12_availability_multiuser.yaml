@@ -1,0 +1,27 @@
+id: availability_multiuser
+description: Finds a mutually free slot across two busy calendars
+tags: [multi_user, availability]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+  - email: bob@example.com
+    display_name: Bob
+seed_events:
+  - user: alice@example.com
+    title: Alice busy
+    start: "2026-06-16T14:00:00+05:30"
+    end: "2026-06-16T15:00:00+05:30"
+  - user: bob@example.com
+    title: Bob busy
+    start: "2026-06-16T15:00:00+05:30"
+    end: "2026-06-16T16:00:00+05:30"
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Find a one-hour slot tomorrow between 1pm and 6pm when bob@example.com and I are both free."
+expect:
+  trajectory:
+    must_call: [check_availability]
+  judge:
+    - criterion: The assistant proposes a one-hour slot that avoids both 2-3pm and 3-4pm (e.g. 4pm-5pm or 5pm-6pm or 1pm-2pm).

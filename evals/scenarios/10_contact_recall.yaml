@@ -1,0 +1,26 @@
+id: contact_recall
+description: A contact taught in session 1 is used to invite them in session 2
+tags: [memory, multi_user]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Just so you know, Alex is alex@corp.com."
+  - user: alice@example.com
+    turns:
+      - "Set up a 3pm sync tomorrow with Alex."
+expect:
+  facts:
+    - user: alice@example.com
+      key: contact:alex
+      value_contains: {email: alex@corp.com}
+  events:
+    - user: alice@example.com
+      title_contains: sync
+      start: "2026-06-16T15:00:00+05:30"
+      attendee: alex@corp.com
+  trajectory:
+    must_call: [create_event]

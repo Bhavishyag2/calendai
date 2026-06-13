@@ -1,0 +1,26 @@
+id: list_today
+description: Lists the events already on the calendar for today
+tags: [crud, read]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+seed_events:
+  - user: alice@example.com
+    title: Design review
+    start: "2026-06-15T11:00:00+05:30"
+    end: "2026-06-15T12:00:00+05:30"
+  - user: alice@example.com
+    title: Lunch with Sam
+    start: "2026-06-15T13:00:00+05:30"
+    end: "2026-06-15T14:00:00+05:30"
+sessions:
+  - user: alice@example.com
+    turns:
+      - "What's on my calendar today?"
+expect:
+  trajectory:
+    must_call: [list_events]
+  final_reply_contains: [design review, lunch]
+  judge:
+    - criterion: The assistant lists both the design review and the lunch.

@@ -1,0 +1,20 @@
+id: nl_time_afternoon
+description: Books "tomorrow afternoon" without an exact time; judged for sanity
+tags: [nl_time]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Block 90 minutes tomorrow afternoon for deep work."
+expect:
+  events:
+    - user: alice@example.com
+      title_contains: deep work
+      present: true
+  trajectory:
+    must_call: [create_event]
+  judge:
+    - criterion: The blocked time is in the afternoon (12pm-6pm) and lasts about 90 minutes.

@@ -1,0 +1,22 @@
+id: timezone_cross
+description: Resolves a meeting given in another timezone into the correct instant
+tags: [edges, timezone]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+    timezone: Asia/Kolkata
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Schedule a call tomorrow at 9am New York time for 30 minutes."
+expect:
+  events:
+    - user: alice@example.com
+      title_contains: call
+      start: "2026-06-16T09:00:00-04:00"
+      end: "2026-06-16T09:30:00-04:00"
+  trajectory:
+    must_call: [create_event]
+  judge:
+    - criterion: The assistant correctly handles the New York timezone (9am EDT == 6:30pm IST) and confirms the time.

@@ -1,0 +1,19 @@
+id: conflict_warning
+description: Booking over an existing event should surface the clash
+tags: [edges, conflict]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+seed_events:
+  - user: alice@example.com
+    title: Existing call
+    start: "2026-06-15T10:00:00+05:30"
+    end: "2026-06-15T11:00:00+05:30"
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Book a new meeting today at 10:30 for half an hour."
+expect:
+  judge:
+    - criterion: The assistant notices that 10:30 overlaps the existing 10-11 call and points out the conflict (it may still book, but it must mention the clash).

@@ -1,0 +1,24 @@
+id: invite_attendee
+description: Creates an event that invites a known email address
+tags: [multi_user, crud]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+  - email: bob@example.com
+    display_name: Bob
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Set up a 1:1 with bob@example.com tomorrow at 2pm for 30 minutes."
+expect:
+  events:
+    - user: alice@example.com
+      start: "2026-06-16T14:00:00+05:30"
+      end: "2026-06-16T14:30:00+05:30"
+      attendee: bob@example.com
+    - user: bob@example.com
+      start: "2026-06-16T14:00:00+05:30"
+      attendee: bob@example.com
+  trajectory:
+    must_call: [create_event]

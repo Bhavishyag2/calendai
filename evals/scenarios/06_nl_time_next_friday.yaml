@@ -1,0 +1,19 @@
+id: nl_time_next_friday
+description: Resolves "this Friday at 4pm for an hour" against the frozen Monday
+tags: [nl_time]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Schedule a project review this Friday at 4pm for an hour."
+expect:
+  events:
+    - user: alice@example.com
+      title_contains: review
+      start: "2026-06-19T16:00:00+05:30"
+      end: "2026-06-19T17:00:00+05:30"
+  trajectory:
+    must_call: [create_event]

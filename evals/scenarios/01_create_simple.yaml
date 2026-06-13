@@ -1,0 +1,21 @@
+id: create_simple
+description: Books a simple meeting at a natural-language time (tomorrow 10:00)
+tags: [crud, nl_time]
+runs: 2
+users:
+  - email: alice@example.com
+    display_name: Alice
+sessions:
+  - user: alice@example.com
+    turns:
+      - "Book a team standup tomorrow from 10:00 to 10:30."
+expect:
+  events:
+    - user: alice@example.com
+      title_contains: standup
+      start: "2026-06-16T10:00:00+05:30"
+      end: "2026-06-16T10:30:00+05:30"
+  trajectory:
+    must_call: [create_event]
+  judge:
+    - criterion: The assistant confirms the booking with a specific date and time.
