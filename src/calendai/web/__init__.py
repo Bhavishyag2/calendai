@@ -1,1 +1,1 @@
-"""FastAPI web app: Google OAuth login, chat (SSE), memory sidebar, trace viewer."""
+"""FastAPI web app: Google OAuth login, chat, memory sidebar, trace viewer."""

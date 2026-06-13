@@ -203,7 +203,7 @@ class Store:
         if not row:
             return None
         expires_at = _parse_dt(row["expires_at"])
-        if expires_at and expires_at < self._clock.now():
+        if expires_at and expires_at <= self._clock.now():  # boundary counts as expired
             return None
         return self.get_user(row["user_id"])
 

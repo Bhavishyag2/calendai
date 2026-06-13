@@ -1,4 +1,4 @@
-"""FastAPI application: OAuth login, chat (SSE), memory sidebar, trace viewer.
+"""FastAPI application: OAuth login, chat, memory sidebar, trace viewer.
 
 Security posture (Batch 6 gate focus):
 - session cookies are opaque server-side tokens (secrets.token_urlsafe), set
@@ -218,6 +218,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - cohesive route table
 
     @app.post("/auth/logout")
     def logout(request: Request, response: Response) -> dict[str, bool]:
+        _require_same_origin(request)
         token = request.cookies.get(SESSION_COOKIE)
         if token:
             _state(request).store.delete_session(token)  # server-side invalidation
