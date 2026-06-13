@@ -51,6 +51,7 @@ Key patterns and required value shapes:
 - rule:no_meetings_on      value {"days": ["saturday", ...]}
 - rule:max_meeting_minutes value {"minutes": <int>}
 - contact:<lowercase first name>  value {"email": "..."}
+- pref:default_duration           value {"minutes": <int>}  (default meeting length)
 - pref:<short_snake_case_slug>    value (any JSON object)
 
 If the exchange contains no durable fact, output exactly: []
