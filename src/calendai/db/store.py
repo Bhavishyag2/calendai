@@ -28,12 +28,20 @@ def _parse_dt(value: str | None) -> datetime | None:
 
 
 class Store:
-    def __init__(self, db_path: str | Path, clock: Clock | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        clock: Clock | None = None,
+        *,
+        check_same_thread: bool = True,
+    ) -> None:
         self.db_path = Path(db_path)
         self._clock = clock or SystemClock()
         if str(self.db_path) != ":memory:":
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        # check_same_thread=False lets the FastAPI threadpool share one
+        # connection; the web app serializes writes with a process lock.
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=check_same_thread)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._init_schema()

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>CalendAI</title>
+<style>
+  :root { --bg:#0f1117; --panel:#171a23; --line:#262b38; --ink:#e6e8ee; --mut:#8b93a7; --accent:#5b8cff; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:12px 18px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; letter-spacing:.3px; }
+  #who { color:var(--mut); font-size:13px; }
+  main { display:grid; grid-template-columns: 1fr 320px; gap:0; height:calc(100vh - 53px); }
+  #chatcol { display:flex; flex-direction:column; min-width:0; }
+  #log { flex:1; overflow:auto; padding:18px; }
+  .msg { max-width:680px; margin:0 0 12px; padding:10px 14px; border-radius:12px; white-space:pre-wrap; }
+  .you { background:#1d2740; margin-left:auto; }
+  .bot { background:var(--panel); border:1px solid var(--line); }
+  .sys { color:var(--mut); font-size:13px; text-align:center; }
+  form#chat { display:flex; gap:8px; padding:14px 18px; border-top:1px solid var(--line); }
+  #box { flex:1; background:var(--panel); border:1px solid var(--line); color:var(--ink); border-radius:10px; padding:11px 13px; font:inherit; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:10px; padding:10px 16px; font:inherit; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--mut); border:1px solid var(--line); }
+  aside { border-left:1px solid var(--line); overflow:auto; padding:16px; }
+  aside h2 { font-size:12px; text-transform:uppercase; letter-spacing:.6px; color:var(--mut); margin:18px 0 8px; }
+  .fact { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:7px; }
+  .fact .k { color:var(--accent); font-size:11px; }
+  .trace { border:1px solid var(--line); border-radius:8px; padding:8px 10px; margin-bottom:7px; cursor:pointer; }
+  .trace pre { white-space:pre-wrap; color:var(--mut); font-size:12px; margin:6px 0 0; }
+  #gate { display:flex; align-items:center; justify-content:center; height:100%; }
+  #gate .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:28px; text-align:center; max-width:360px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📅 CalendAI</h1>
+  <div><span id="who"></span> <button id="logout" class="ghost" style="display:none">Sign out</button></div>
+</header>
+
+<div id="gate" style="display:none">
+  <div class="card">
+    <h2 style="color:var(--ink)">Sign in to continue</h2>
+    <p style="color:var(--mut)">CalendAI manages your Google Calendar through a stateful agent with long-term memory.</p>
+    <a href="/auth/login"><button>Continue with Google</button></a>
+    <div id="dev" style="display:none; margin-top:14px">
+      <input id="devmail" class="ghost" style="padding:9px;border-radius:8px;width:60%" placeholder="you@example.com" />
+      <button id="devbtn" class="ghost">Dev login</button>
+    </div>
+  </div>
+</div>
+
+<main id="appui" style="display:none">
+  <section id="chatcol">
+    <div id="log"><div class="msg sys">Ask me to book, move, or cancel meetings — or teach me a rule like “never schedule before 10am”.</div></div>
+    <form id="chat"><input id="box" autocomplete="off" placeholder="Message CalendAI…" /><button>Send</button></form>
+  </section>
+  <aside>
+    <h2>Memory</h2><div id="facts"><div class="sys" style="color:var(--mut)">No facts yet.</div></div>
+    <h2>Recent traces</h2><div id="traces"></div>
+  </aside>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const log = $("#log");
+function add(role, text){ const d=document.createElement("div"); d.className="msg "+role; d.textContent=text; log.appendChild(d); log.scrollTop=log.scrollHeight; return d; }
+
+async function api(path, opts){ const r = await fetch(path, opts); if(!r.ok) throw new Error(r.status); return r.json(); }
+
+async function boot(){
+  try { const me = await api("/api/me"); showApp(me); }
+  catch { showGate(); }
+}
+function showGate(){
+  $("#gate").style.display="flex"; $("#appui").style.display="none";
+  fetch("/auth/dev-login",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"})
+    .then(r => { if(r.status!==404) $("#dev").style.display="block"; });
+}
+function showApp(me){
+  $("#gate").style.display="none"; $("#appui").style.display="grid";
+  $("#who").textContent = me.email + " · " + me.timezone;
+  $("#logout").style.display="inline-block";
+  refreshFacts(); refreshTraces();
+}
+
+$("#chat").addEventListener("submit", async e => {
+  e.preventDefault();
+  const box=$("#box"); const text=box.value.trim(); if(!text) return;
+  box.value=""; add("you", text);
+  const thinking = add("sys","…");
+  try {
+    const res = await api("/api/chat",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:text})});
+    thinking.remove(); add("bot", res.reply);
+    refreshFacts(); refreshTraces();
+  } catch(err){ thinking.remove(); add("sys","Error: "+err.message); }
+});
+
+$("#logout").addEventListener("click", async ()=>{ await fetch("/auth/logout",{method:"POST"}); location.reload(); });
+$("#devbtn")?.addEventListener("click", async ()=>{
+  const email=$("#devmail").value.trim(); if(!email) return;
+  const r=await fetch("/auth/dev-login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({email})});
+  if(r.ok) location.reload();
+});
+
+async function refreshFacts(){
+  const {facts}=await api("/api/facts"); const el=$("#facts");
+  el.innerHTML = facts.length ? "" : '<div class="sys" style="color:var(--mut)">No facts yet.</div>';
+  facts.forEach(f=>{ const d=document.createElement("div"); d.className="fact"; d.innerHTML=`<div class="k">[${f.type}] ${f.key}</div>${f.statement}`; el.appendChild(d); });
+}
+async function refreshTraces(){
+  const {requests}=await api("/api/traces"); const el=$("#traces"); el.innerHTML="";
+  requests.slice(0,8).forEach(rq=>{
+    const d=document.createElement("div"); d.className="trace"; d.textContent=rq.user_message.slice(0,60);
+    d.onclick=async()=>{ const det=await api("/api/traces/"+rq.request_id);
+      let pre=d.querySelector("pre"); if(pre){pre.remove();return;}
+      pre=document.createElement("pre");
+      pre.textContent=det.spans.map(s=>`${s.kind}  ${s.name}`+(s.rationale?`  — ${s.rationale}`:"")).join("\n");
+      d.appendChild(pre); };
+    el.appendChild(d);
+  });
+}
+boot();
+</script>
+</body>
+</html>
